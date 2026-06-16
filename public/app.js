@@ -102,7 +102,53 @@ async function fetchLinks() {
   try {
     const res = await fetch('/api/links');
     if (!res.ok) throw new Error('Failed to load queue.');
-    links = await res.json();
+    const apiLinks = await res.json();
+    
+    // Auto-Heal: retrieve local copy to sync with server if it was wiped
+    let localLinks = [];
+    try {
+      localLinks = JSON.parse(localStorage.getItem('indexer_links')) || [];
+    } catch (e) {
+      localLinks = [];
+    }
+
+    // Identify URLs in local storage that aren't on the server
+    const apiUrls = new Set(apiLinks.map(l => l.original_url));
+    const missingUrls = [];
+    
+    localLinks.forEach(localLink => {
+      if (localLink && localLink.original_url && !apiUrls.has(localLink.original_url)) {
+        missingUrls.push(localLink.original_url);
+      }
+    });
+
+    if (missingUrls.length > 0) {
+      console.log(`[Auto-Heal] Wiped database detected. Restoring ${missingUrls.length} link(s) from browser cache...`);
+      // Restore them silently in the background
+      try {
+        await fetch('/api/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: missingUrls })
+        });
+        
+        // Refetch to populate the full links state
+        const refetchRes = await fetch('/api/links');
+        if (refetchRes.ok) {
+          links = await refetchRes.json();
+        } else {
+          links = apiLinks;
+        }
+      } catch (err) {
+        console.error('[Auto-Heal] Restore failed:', err);
+        links = apiLinks;
+      }
+    } else {
+      links = apiLinks;
+    }
+
+    // Keep localStorage in sync
+    localStorage.setItem('indexer_links', JSON.stringify(links));
     
     renderLinksTable();
     updateStats();

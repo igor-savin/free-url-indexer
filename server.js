@@ -70,13 +70,26 @@ function setSetting(key, value) {
 // ----------------------------------------------------
 app.get('/go/:id', (req, res) => {
   try {
+    const id = req.params.id;
+
+    // Try DB first
     const stmt = db.prepare('SELECT original_url FROM links WHERE id = ?');
-    const link = stmt.get(req.params.id);
+    const link = stmt.get(id);
 
     if (link) {
-      console.log(`[Redirect] Short ID "${req.params.id}" -> ${link.original_url}`);
-      // Issue 301 Permanent Redirect for crawlers to follow
+      console.log(`[Redirect DB] Short ID "${id}" -> ${link.original_url}`);
       return res.redirect(301, link.original_url);
+    }
+
+    // Fallback: Try decoding as Base64URL (stateless redirect)
+    try {
+      const base64 = id.replace(/-/g, '+').replace(/_/g, '/');
+      const decodedUrl = Buffer.from(base64, 'base64').toString('utf8');
+      new URL(decodedUrl); // Check if valid URL
+      console.log(`[Redirect Stateless] Decoded "${id}" -> ${decodedUrl}`);
+      return res.redirect(301, decodedUrl);
+    } catch (e) {
+      // Not a valid Base64URL
     }
   } catch (err) {
     console.error('[Error] Redirect lookup failed:', err);
@@ -147,8 +160,11 @@ app.post('/api/submit', (req, res) => {
       continue;
     }
 
-    // Generate unique short ID
-    const shortId = crypto.randomBytes(4).toString('hex');
+    // Generate unique short ID (Base64URL encoded destination URL to support stateless fallback)
+    const shortId = Buffer.from(url).toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
     const now = new Date().toISOString();
 
     try {
