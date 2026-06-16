@@ -1,0 +1,5 @@
+node_modules/
+service_account.json
+indexer.db
+links.json
+.DS_Store

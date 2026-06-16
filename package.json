@@ -1,0 +1,14 @@
+{
+  "name": "free-url-indexer",
+  "version": "1.0.0",
+  "description": "Programmatic indexing of owned and third-party URLs using the Google Indexing API and dynamic 301 redirects.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --experimental-sqlite server.js",
+    "index": "node --experimental-sqlite indexer.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^140.0.0"
+  }
+}
