@@ -21,6 +21,7 @@ const DEMO_LINKS = [
 // Elements
 const urlInput = document.getElementById('url-input');
 const urlForm = document.getElementById('url-submit-form');
+const btnSubmitUrls = document.getElementById('btn-submit-urls');
 const btnLoadDemo = document.getElementById('btn-load-demo');
 const btnTriggerIndexing = document.getElementById('btn-trigger-indexing');
 const btnCheckStatus = document.getElementById('btn-check-status');

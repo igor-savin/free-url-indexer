@@ -2,20 +2,36 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { DatabaseSync } = require('node:sqlite');
 const { google } = require('googleapis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-// Ensure directory exists if custom path is provided
-if (!fs.existsSync(DATA_DIR)) {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch (err) {
-    console.error(`Failed to create DATA_DIR: ${DATA_DIR}`, err);
+
+function resolveDataDir(preferredDir) {
+  const candidates = [
+    preferredDir,
+    path.join(os.tmpdir(), 'free-url-indexer'),
+    __dirname
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      fs.mkdirSync(candidate, { recursive: true });
+      fs.accessSync(candidate, fs.constants.W_OK);
+      return candidate;
+    } catch (err) {
+      console.warn(`[Storage] Cannot use ${candidate}: ${err.message}`);
+    }
   }
+
+  throw new Error('No writable data directory is available.');
 }
+
+const DATA_DIR = resolveDataDir(process.env.DATA_DIR || __dirname);
+console.log(`[Storage] Using data directory: ${DATA_DIR}`);
+
 const DB_PATH = path.join(DATA_DIR, 'indexer.db');
 const KEY_FILE = path.join(DATA_DIR, 'service_account.json');
 
