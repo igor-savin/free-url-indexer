@@ -74,3 +74,4 @@ If you want to submit a single URL directly without the database:
 ```bash
 node indexer.js https://yourdomain.com/some-page-to-index
 ```
+# free-url-indexer
