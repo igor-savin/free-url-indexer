@@ -7,8 +7,17 @@ const { google } = require('googleapis');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DB_PATH = path.join(__dirname, 'indexer.db');
-const KEY_FILE = path.join(__dirname, 'service_account.json');
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+// Ensure directory exists if custom path is provided
+if (!fs.existsSync(DATA_DIR)) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (err) {
+    console.error(`Failed to create DATA_DIR: ${DATA_DIR}`, err);
+  }
+}
+const DB_PATH = path.join(DATA_DIR, 'indexer.db');
+const KEY_FILE = path.join(DATA_DIR, 'service_account.json');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
