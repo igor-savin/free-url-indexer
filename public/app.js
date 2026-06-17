@@ -3,7 +3,8 @@ let links = [];
 let appSettings = {
   baseDomain: '',
   hasGcpKey: false,
-  gcpEmail: null
+  gcpEmail: null,
+  gcpKeySource: null
 };
 let selectedIds = new Set();
 
@@ -170,13 +171,18 @@ async function fetchSettings() {
       apiStatusText.textContent = 'GCP Key Loaded';
       
       keyStatusBox.style.display = 'flex';
-      keyEmailDisplay.textContent = `Key email: ${appSettings.gcpEmail}`;
+      const keySource = appSettings.gcpKeySource === 'environment'
+        ? 'Render environment'
+        : 'uploaded file';
+      keyEmailDisplay.textContent = `Key email: ${appSettings.gcpEmail} (${keySource})`;
+      btnDeleteKey.style.display = appSettings.gcpKeySource === 'environment' ? 'none' : 'inline-flex';
       textareaGcpKey.placeholder = 'Google service account key loaded. Paste new JSON to replace it.';
     } else {
       apiDot.className = 'indicator-dot red';
       apiStatusText.textContent = 'GCP Key Missing';
       
       keyStatusBox.style.display = 'none';
+      btnDeleteKey.style.display = 'inline-flex';
       textareaGcpKey.placeholder = '{ "type": "service_account", ... }';
     }
 

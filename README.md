@@ -43,6 +43,18 @@ It replicates the exact core mechanics of paid services like **Prime Indexer** b
    ```
 2. Save your service account key file as `service_account.json` in this directory.
 
+### Render Environment Variables
+For Render deployments, store secrets in environment variables so they survive restarts and never get committed to Git.
+
+Set these in **Render > Your Web Service > Environment**:
+
+```text
+BASE_DOMAIN=https://link.calhearing.com
+GOOGLE_SERVICE_ACCOUNT_JSON={paste the full service account JSON here}
+```
+
+`DATA_DIR` is optional. On Render's free plan, do not set it to `/var/data` unless you have attached a persistent disk.
+
 ---
 
 ## How to Run It

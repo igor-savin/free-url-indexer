@@ -35,6 +35,32 @@ console.log(`[Storage] Using data directory: ${DATA_DIR}`);
 const DB_PATH = path.join(DATA_DIR, 'indexer.db');
 const KEY_FILE = path.join(DATA_DIR, 'service_account.json');
 
+function parseServiceAccountJson(rawJson) {
+  const parsedKey = JSON.parse(rawJson);
+  if (!parsedKey.client_email || !parsedKey.private_key) {
+    throw new Error('Invalid service account JSON: client_email and private_key are required.');
+  }
+  return parsedKey;
+}
+
+function getServiceAccountKey() {
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    return {
+      key: parseServiceAccountJson(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
+      source: 'environment'
+    };
+  }
+
+  if (fs.existsSync(KEY_FILE)) {
+    return {
+      key: parseServiceAccountJson(fs.readFileSync(KEY_FILE, 'utf8')),
+      source: 'file'
+    };
+  }
+
+  return null;
+}
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -203,22 +229,21 @@ app.post('/api/submit', (req, res) => {
 // GET /api/settings - Retrieve app configurations
 app.get('/api/settings', (req, res) => {
   const baseDomain = getSetting('base_domain') || `http://localhost:${PORT}`;
-  const hasGcpKey = fs.existsSync(KEY_FILE);
+  const serviceAccount = getServiceAccountKey();
+  const hasGcpKey = Boolean(serviceAccount);
   let gcpEmail = null;
+  let gcpKeySource = null;
 
-  if (hasGcpKey) {
-    try {
-      const gcpKey = JSON.parse(fs.readFileSync(KEY_FILE, 'utf8'));
-      gcpEmail = gcpKey.client_email;
-    } catch (e) {
-      gcpEmail = 'Error parsing JSON key';
-    }
+  if (serviceAccount) {
+    gcpEmail = serviceAccount.key.client_email;
+    gcpKeySource = serviceAccount.source;
   }
 
   res.json({
     baseDomain,
     hasGcpKey,
-    gcpEmail
+    gcpEmail,
+    gcpKeySource
   });
 });
 
@@ -235,10 +260,7 @@ app.post('/api/settings', (req, res) => {
 
     if (gcpKeyJson) {
       // Validate JSON format
-      const parsedKey = JSON.parse(gcpKeyJson);
-      if (!parsedKey.client_email || !parsedKey.private_key) {
-        return res.status(400).json({ error: 'Invalid service account JSON: client_email and private_key are required.' });
-      }
+      const parsedKey = parseServiceAccountJson(gcpKeyJson);
       fs.writeFileSync(KEY_FILE, JSON.stringify(parsedKey, null, 2));
     }
 
@@ -263,9 +285,12 @@ app.delete('/api/settings/gcp-key', (req, res) => {
 // POST /api/trigger - Trigger indexing requests to Google Indexing API
 app.post('/api/trigger', async (req, res) => {
   const { ids } = req.body;
+  const serviceAccount = getServiceAccountKey();
   
-  if (!fs.existsSync(KEY_FILE)) {
-    return res.status(400).json({ error: 'Google Service Account JSON key is missing. Upload it in settings first.' });
+  if (!serviceAccount) {
+    return res.status(400).json({
+      error: 'Google Service Account JSON key is missing. Add GOOGLE_SERVICE_ACCOUNT_JSON in Render or upload it in settings first.'
+    });
   }
 
   // Fetch URLs to index
@@ -294,7 +319,7 @@ app.post('/api/trigger', async (req, res) => {
   // Set up Google JWT auth client
   let jwtClient;
   try {
-    const credentials = JSON.parse(fs.readFileSync(KEY_FILE, 'utf8'));
+    const credentials = serviceAccount.key;
     jwtClient = new google.auth.JWT(
       credentials.client_email,
       null,
