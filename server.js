@@ -40,6 +40,8 @@ const KEY_FILE = path.join(DATA_DIR, 'service_account.json');
 const AUTH_BASE_URL = (process.env.AUTH_BASE_URL || process.env.BASE_DOMAIN || '').replace(/\/$/, '');
 const AUTH_ENABLED = Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const INDEXNOW_KEY = process.env.INDEXNOW_KEY ||
+  crypto.createHash('sha256').update(`${SESSION_SECRET}:indexnow`).digest('hex').slice(0, 32);
 const ALLOWED_GOOGLE_EMAILS = (process.env.ALLOWED_GOOGLE_EMAILS || '')
   .split(',')
   .map(email => email.trim().toLowerCase())
@@ -65,6 +67,11 @@ const GOOGLE_INDEX_STATUS = {
   FOUND: 'Found',
   NOT_FOUND: 'Not Found',
   CHECK_FAILED: 'Check Failed'
+};
+const INDEXNOW_STATUS = {
+  NOT_SUBMITTED: 'Not Submitted',
+  SUBMITTED: 'Submitted',
+  FAILED: 'Failed'
 };
 
 function parseServiceAccountJson(rawJson) {
@@ -161,7 +168,11 @@ try {
       indexed_at TEXT,
       last_error TEXT,
       google_index_status TEXT DEFAULT 'Not Checked',
-      google_index_checked_at TEXT
+      google_index_checked_at TEXT,
+      bing_indexnow_status TEXT DEFAULT 'Not Submitted',
+      yahoo_indexnow_status TEXT DEFAULT 'Not Submitted',
+      indexnow_submitted_at TEXT,
+      indexnow_error TEXT
     )
   `);
 
@@ -183,6 +194,38 @@ try {
 
   try {
     db.exec('ALTER TABLE links ADD COLUMN google_index_checked_at TEXT');
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec("ALTER TABLE links ADD COLUMN bing_indexnow_status TEXT DEFAULT 'Not Submitted'");
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec("ALTER TABLE links ADD COLUMN yahoo_indexnow_status TEXT DEFAULT 'Not Submitted'");
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec('ALTER TABLE links ADD COLUMN indexnow_submitted_at TEXT');
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec('ALTER TABLE links ADD COLUMN indexnow_error TEXT');
   } catch (err) {
     if (!String(err.message).includes('duplicate column name')) {
       throw err;
@@ -338,6 +381,34 @@ async function checkGoogleIndexForUrl(url) {
   };
 }
 
+async function submitUrlsToIndexNow(urls, req) {
+  const baseDomain = getBaseDomain(req);
+  const host = new URL(baseDomain).hostname;
+  const keyLocation = `${baseDomain}/${INDEXNOW_KEY}.txt`;
+  const response = await fetch('https://api.indexnow.org/indexnow', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8'
+    },
+    body: JSON.stringify({
+      host,
+      key: INDEXNOW_KEY,
+      keyLocation,
+      urlList: urls
+    })
+  });
+
+  if (![200, 202].includes(response.status)) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`IndexNow returned HTTP ${response.status}${body ? `: ${body.slice(0, 180)}` : ''}`);
+  }
+
+  return {
+    status: response.status,
+    keyLocation
+  };
+}
+
 function isLoggedIn(req) {
   return !AUTH_ENABLED || (req.isAuthenticated && req.isAuthenticated());
 }
@@ -424,6 +495,10 @@ app.get('/go/:id', (req, res) => {
 // Google Search Console Verification File Auto-Responder
 app.get('/google:hash.html', (req, res) => {
   res.send(`google-site-verification: google${req.params.hash}.html`);
+});
+
+app.get(`/${INDEXNOW_KEY}.txt`, (req, res) => {
+  res.type('text/plain').send(INDEXNOW_KEY);
 });
 
 app.get('/login', (req, res) => {
@@ -705,6 +780,106 @@ app.post('/api/trigger', async (req, res) => {
   }
 
   res.json({ success: true, processedCount: linksToProcess.length, results });
+});
+
+// POST /api/trigger-indexnow - Submit redirect URLs to IndexNow for Bing/Yahoo discovery.
+app.post('/api/trigger-indexnow', async (req, res) => {
+  const { ids } = req.body;
+  let linksToProcess = [];
+
+  try {
+    if (ids && Array.isArray(ids) && ids.length > 0) {
+      const placeholders = ids.map(() => '?').join(',');
+      const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
+      linksToProcess = stmt.all(...ids);
+    } else {
+      const stmt = db.prepare(`
+        SELECT * FROM links
+        WHERE bing_indexnow_status IN (?, ?)
+           OR yahoo_indexnow_status IN (?, ?)
+           OR bing_indexnow_status IS NULL
+           OR yahoo_indexnow_status IS NULL
+      `);
+      linksToProcess = stmt.all(
+        INDEXNOW_STATUS.NOT_SUBMITTED,
+        INDEXNOW_STATUS.FAILED,
+        INDEXNOW_STATUS.NOT_SUBMITTED,
+        INDEXNOW_STATUS.FAILED
+      );
+    }
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to query database: ' + err.message });
+  }
+
+  if (linksToProcess.length === 0) {
+    return res.json({ success: true, message: 'No links need IndexNow submission.' });
+  }
+
+  const baseDomain = getBaseDomain(req);
+  const redirectUrls = linksToProcess.map(link => `${baseDomain}/go/${link.id}`);
+  const now = new Date().toISOString();
+  const updateStmt = db.prepare(`
+    UPDATE links
+    SET bing_indexnow_status = ?,
+        yahoo_indexnow_status = ?,
+        indexnow_submitted_at = ?,
+        indexnow_error = ?
+    WHERE id = ?
+  `);
+
+  try {
+    const indexNowResult = await submitUrlsToIndexNow(redirectUrls, req);
+    const results = linksToProcess.map((link, index) => {
+      updateStmt.run(
+        INDEXNOW_STATUS.SUBMITTED,
+        INDEXNOW_STATUS.SUBMITTED,
+        now,
+        null,
+        link.id
+      );
+
+      return {
+        id: link.id,
+        url: redirectUrls[index],
+        success: true,
+        bingStatus: INDEXNOW_STATUS.SUBMITTED,
+        yahooStatus: INDEXNOW_STATUS.SUBMITTED
+      };
+    });
+
+    res.json({
+      success: true,
+      processedCount: linksToProcess.length,
+      indexNowStatus: indexNowResult.status,
+      keyLocation: indexNowResult.keyLocation,
+      results
+    });
+  } catch (err) {
+    const results = linksToProcess.map((link, index) => {
+      updateStmt.run(
+        INDEXNOW_STATUS.FAILED,
+        INDEXNOW_STATUS.FAILED,
+        now,
+        err.message,
+        link.id
+      );
+
+      return {
+        id: link.id,
+        url: redirectUrls[index],
+        success: false,
+        error: err.message,
+        bingStatus: INDEXNOW_STATUS.FAILED,
+        yahooStatus: INDEXNOW_STATUS.FAILED
+      };
+    });
+
+    res.status(502).json({
+      error: err.message,
+      processedCount: linksToProcess.length,
+      results
+    });
+  }
 });
 
 // POST /api/check-status - Verify redirect and target reachability.

@@ -27,6 +27,11 @@ const GOOGLE_INDEX_META = {
   'Not Found': { label: 'Not Found', className: 'index-not-found' },
   'Check Failed': { label: 'Check Failed', className: 'index-not-found' }
 };
+const ENGINE_META = {
+  'Not Submitted': { label: 'Not Submitted', className: 'engine-unknown' },
+  Submitted: { label: 'Submitted', className: 'engine-submitted' },
+  Failed: { label: 'Failed', className: 'engine-failed' }
+};
 
 // Demo links matching the user's uploaded image!
 const DEMO_LINKS = [
@@ -45,6 +50,7 @@ const urlForm = document.getElementById('url-submit-form');
 const btnSubmitUrls = document.getElementById('btn-submit-urls');
 const btnLoadDemo = document.getElementById('btn-load-demo');
 const btnTriggerIndexing = document.getElementById('btn-trigger-indexing');
+const btnTriggerIndexNow = document.getElementById('btn-trigger-indexnow');
 const btnCheckStatus = document.getElementById('btn-check-status');
 const searchInput = document.getElementById('search-input');
 const btnDeleteSelected = document.getElementById('btn-delete-selected');
@@ -113,6 +119,7 @@ function setupEventListeners() {
 
   // Actions
   btnTriggerIndexing.addEventListener('click', handleTriggerIndexing);
+  btnTriggerIndexNow.addEventListener('click', handleTriggerIndexNow);
   btnCheckStatus.addEventListener('click', handleCheckStatus);
 }
 
@@ -258,6 +265,13 @@ function renderLinksTable() {
       ? new Date(link.google_index_checked_at).toLocaleString()
       : '';
     const googleSearchUrl = buildGoogleSearchUrl(link.original_url);
+    const bingStatus = link.bing_indexnow_status || 'Not Submitted';
+    const yahooStatus = link.yahoo_indexnow_status || 'Not Submitted';
+    const bingMeta = ENGINE_META[bingStatus] || ENGINE_META['Not Submitted'];
+    const yahooMeta = ENGINE_META[yahooStatus] || ENGINE_META['Not Submitted'];
+    const indexNowCheckedAt = link.indexnow_submitted_at
+      ? new Date(link.indexnow_submitted_at).toLocaleString()
+      : '';
 
     return `
       <tr data-id="${link.id}">
@@ -270,7 +284,11 @@ function renderLinksTable() {
         </td>
         <td>
           <div class="index-outcome">
-            <span class="index-pill ${googleIndexMeta.className}" title="${googleCheckedAt ? `Checked ${googleCheckedAt}` : ''}">${googleIndexMeta.label}</span>
+            <div class="engine-line">
+              <span class="engine-badge ${googleIndexMeta.className}" title="${googleCheckedAt ? `Checked ${googleCheckedAt}` : ''}">G: ${googleIndexMeta.label}</span>
+              <span class="engine-badge ${bingMeta.className}" title="${indexNowCheckedAt ? `Submitted ${indexNowCheckedAt}` : ''}">B: ${bingMeta.label}</span>
+              <span class="engine-badge ${yahooMeta.className}" title="${indexNowCheckedAt ? `Submitted via IndexNow ${indexNowCheckedAt}` : 'Yahoo is tracked through IndexNow sharing'}">Y: ${yahooMeta.label}</span>
+            </div>
             <div class="index-actions">
               <button class="index-action-btn" onclick="checkGoogleIndexStatus('${link.id}')" title="Automatically check Google results">Check</button>
               <a class="index-action-link" href="${googleSearchUrl}" target="_blank" title="Open this search on Google">Open</a>
@@ -391,6 +409,43 @@ async function handleTriggerIndexing() {
   } finally {
     btnTriggerIndexing.disabled = false;
     btnTriggerIndexing.innerHTML = originalText;
+  }
+}
+
+async function handleTriggerIndexNow() {
+  const idsToTrigger = Array.from(selectedIds);
+  const isAll = idsToTrigger.length === 0;
+
+  if (isAll && !confirm('No rows selected. Submit all not-yet-submitted/failed links to Bing/Yahoo via IndexNow?')) {
+    return;
+  }
+
+  btnTriggerIndexNow.disabled = true;
+  const originalText = btnTriggerIndexNow.innerHTML;
+  btnTriggerIndexNow.innerHTML = `<span class="btn-icon">⏳</span><div><strong>Submitting...</strong><small>Calling IndexNow</small></div>`;
+
+  try {
+    const res = await fetch('/api/trigger-indexnow', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: idsToTrigger })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'IndexNow submission failed.');
+
+    showToast(`IndexNow accepted ${data.processedCount} link(s) for Bing/Yahoo discovery.`, 'success');
+
+    selectedIds.clear();
+    selectAllCheckbox.checked = false;
+
+    await fetchLinks();
+  } catch (err) {
+    showToast(err.message, 'error');
+    await fetchLinks();
+  } finally {
+    btnTriggerIndexNow.disabled = false;
+    btnTriggerIndexNow.innerHTML = originalText;
   }
 }
 

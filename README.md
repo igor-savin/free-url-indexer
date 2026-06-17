@@ -55,9 +55,12 @@ GOOGLE_CLIENT_ID={Google OAuth web client ID}
 GOOGLE_CLIENT_SECRET={Google OAuth web client secret}
 SESSION_SECRET={a long random string}
 ALLOWED_GOOGLE_EMAILS=you@example.com
+INDEXNOW_KEY={optional 8-128 character key for Bing/Yahoo IndexNow}
 ```
 
 `DATA_DIR` is optional. On Render's free plan, do not set it to `/var/data` unless you have attached a persistent disk.
+
+`INDEXNOW_KEY` is optional. If omitted, the app derives a stable key from `SESSION_SECRET` and serves it at `https://link.calhearing.com/{key}.txt`.
 
 For Google login, create an OAuth 2.0 **Web application** client in Google Cloud and add this authorized redirect URI:
 
