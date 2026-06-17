@@ -16,6 +16,13 @@ It replicates the exact core mechanics of paid services like **Prime Indexer** b
    - You run the indexer script to submit `https://yourdomain.com/go/abc1234` to the Google Indexing API.
    - Googlebot crawls the shortlink, follows the redirect to Medium, and crawls/indexes the final post.
 
+The dashboard also creates a public discovery layer search engines can crawl:
+
+- `/hub` lists every submitted target URL as a normal public link.
+- `/sitemap.xml` lists the hub and redirect URLs on your verified domain.
+- `/feed.xml` publishes the latest submitted redirect URLs as an RSS feed.
+- Each row has an **SEO** check that inspects the target page for common blockers such as `noindex`, bad HTTP status, non-HTML responses, thin pages, and canonical tags pointing somewhere else.
+
 ---
 
 ## Setup Guide
@@ -93,6 +100,17 @@ BASE_DOMAIN=https://yourdomain.com npm run index
 ```
 
 This will read your `links.json`, generate redirect shortlinks for all registered URLs, and submit them one-by-one to Google.
+
+### 4. Help Discovery
+After adding URLs, open these public pages and optionally submit the sitemap in Google Search Console and Bing Webmaster Tools:
+
+```text
+https://link.calhearing.com/hub
+https://link.calhearing.com/sitemap.xml
+https://link.calhearing.com/feed.xml
+```
+
+Use the row-level **SEO** button before waiting on search results. If a target page returns `Blocked`, the external page is likely telling crawlers not to index it or is returning an error. If it returns `OK`, the app has done what it can: submit the verified redirect, expose the URL in the hub/sitemap/feed, and confirm the target page looks crawlable.
 
 ### (Optional) Indexing directly from the Command Line
 If you want to submit a single URL directly without the database:

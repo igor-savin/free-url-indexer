@@ -73,6 +73,13 @@ const INDEXNOW_STATUS = {
   SUBMITTED: 'Submitted',
   FAILED: 'Failed'
 };
+const SEO_STATUS = {
+  NOT_CHECKED: 'Not Checked',
+  OK: 'OK',
+  ISSUES: 'Issues',
+  BLOCKED: 'Blocked',
+  ERROR: 'Error'
+};
 
 function parseServiceAccountJson(rawJson) {
   const parsedKey = JSON.parse(rawJson);
@@ -172,7 +179,10 @@ try {
       bing_indexnow_status TEXT DEFAULT 'Not Submitted',
       yahoo_indexnow_status TEXT DEFAULT 'Not Submitted',
       indexnow_submitted_at TEXT,
-      indexnow_error TEXT
+      indexnow_error TEXT,
+      seo_status TEXT DEFAULT 'Not Checked',
+      seo_checked_at TEXT,
+      seo_report TEXT
     )
   `);
 
@@ -226,6 +236,30 @@ try {
 
   try {
     db.exec('ALTER TABLE links ADD COLUMN indexnow_error TEXT');
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec("ALTER TABLE links ADD COLUMN seo_status TEXT DEFAULT 'Not Checked'");
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec('ALTER TABLE links ADD COLUMN seo_checked_at TEXT');
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec('ALTER TABLE links ADD COLUMN seo_report TEXT');
   } catch (err) {
     if (!String(err.message).includes('duplicate column name')) {
       throw err;
@@ -318,6 +352,122 @@ async function fetchWithFallback(url) {
   } catch (headError) {
     return fetch(url, { ...requestOptions, method: 'GET' });
   }
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeXml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function extractMetaContent(html, name) {
+  const pattern = new RegExp(`<meta[^>]+(?:name|property)=["']${name}["'][^>]*content=["']([^"']*)["'][^>]*>|<meta[^>]+content=["']([^"']*)["'][^>]*(?:name|property)=["']${name}["'][^>]*>`, 'i');
+  const match = html.match(pattern);
+  return match ? (match[1] || match[2] || '').trim() : null;
+}
+
+function extractTitle(html) {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match ? match[1].replace(/\s+/g, ' ').trim() : null;
+}
+
+function extractCanonical(html) {
+  const match = html.match(/<link[^>]+rel=["'][^"']*canonical[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>|<link[^>]+href=["']([^"']+)["'][^>]*rel=["'][^"']*canonical[^"']*["'][^>]*>/i);
+  return match ? (match[1] || match[2] || '').trim() : null;
+}
+
+async function inspectTargetSeo(url) {
+  const startedUrl = url;
+  const response = await fetch(url, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (compatible; CalHearingIndexer/1.0; +https://link.calhearing.com)'
+    }
+  });
+
+  const finalUrl = response.url || startedUrl;
+  const contentType = response.headers.get('content-type') || '';
+  const xRobotsTag = response.headers.get('x-robots-tag') || '';
+  const html = contentType.includes('text/html') ? await response.text() : '';
+  const robotsMeta = html ? extractMetaContent(html, 'robots') : null;
+  const googlebotMeta = html ? extractMetaContent(html, 'googlebot') : null;
+  const title = html ? extractTitle(html) : null;
+  const canonical = html ? extractCanonical(html) : null;
+  const issues = [];
+
+  if (response.status >= 400) {
+    issues.push(`HTTP ${response.status}`);
+  }
+
+  if (!contentType.includes('text/html')) {
+    issues.push(`Non-HTML content type: ${contentType || 'unknown'}`);
+  }
+
+  const robotsText = `${xRobotsTag} ${robotsMeta || ''} ${googlebotMeta || ''}`.toLowerCase();
+  if (robotsText.includes('noindex')) {
+    issues.push('noindex detected');
+  }
+
+  if (robotsText.includes('none')) {
+    issues.push('robots none detected');
+  }
+
+  if (canonical) {
+    try {
+      const canonicalUrl = new URL(canonical, finalUrl).toString();
+      const normalizedFinal = finalUrl.replace(/\/$/, '');
+      const normalizedCanonical = canonicalUrl.replace(/\/$/, '');
+      if (normalizedCanonical !== normalizedFinal) {
+        issues.push(`canonical points elsewhere: ${canonicalUrl}`);
+      }
+    } catch (err) {
+      issues.push(`invalid canonical: ${canonical}`);
+    }
+  }
+
+  if (!title && html) {
+    issues.push('missing title');
+  }
+
+  if (html && html.length < 800) {
+    issues.push('very thin HTML response');
+  }
+
+  let status = SEO_STATUS.OK;
+  if (issues.some(issue => issue.includes('noindex') || issue.includes('robots none') || issue.startsWith('HTTP 4') || issue.startsWith('HTTP 5'))) {
+    status = SEO_STATUS.BLOCKED;
+  } else if (issues.length > 0) {
+    status = SEO_STATUS.ISSUES;
+  }
+
+  return {
+    status,
+    checkedAt: new Date().toISOString(),
+    httpStatus: response.status,
+    finalUrl,
+    contentType,
+    title,
+    canonical,
+    robotsMeta,
+    googlebotMeta,
+    xRobotsTag,
+    issues
+  };
 }
 
 function buildGoogleIndexQuery(url) {
@@ -667,6 +817,96 @@ app.get('/google:hash.html', (req, res) => {
 
 app.get(`/${INDEXNOW_KEY}.txt`, (req, res) => {
   res.type('text/plain').send(INDEXNOW_KEY);
+});
+
+app.get('/hub', (req, res) => {
+  const baseDomain = getBaseDomain(req);
+  const links = db.prepare('SELECT * FROM links ORDER BY created_at DESC').all();
+  const rows = links.map(link => {
+    const redirectUrl = `${baseDomain}/go/${link.id}`;
+    const title = link.seo_report ? (() => {
+      try {
+        return JSON.parse(link.seo_report).title || link.original_url;
+      } catch (err) {
+        return link.original_url;
+      }
+    })() : link.original_url;
+
+    return `<li>
+      <a href="${escapeHtml(link.original_url)}">${escapeHtml(title)}</a>
+      <div><small>Target: ${escapeHtml(link.original_url)}</small></div>
+      <div><small>Gateway: <a href="${escapeHtml(redirectUrl)}">${escapeHtml(redirectUrl)}</a></small></div>
+    </li>`;
+  }).join('\n');
+
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CalHearing Index Hub</title>
+  <meta name="robots" content="index,follow">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 920px; margin: 40px auto; padding: 0 20px; line-height: 1.5; color: #172033; }
+    h1 { margin-bottom: 8px; }
+    p { color: #526071; }
+    li { margin: 18px 0; padding-bottom: 18px; border-bottom: 1px solid #e5e7eb; }
+    a { color: #0f5db8; }
+    small { color: #667085; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>CalHearing Index Hub</h1>
+  <p>Public discovery hub for recently submitted URLs.</p>
+  <ul>
+    ${rows || '<li>No submitted URLs yet.</li>'}
+  </ul>
+</body>
+</html>`);
+});
+
+app.get('/sitemap.xml', (req, res) => {
+  const baseDomain = getBaseDomain(req);
+  const links = db.prepare('SELECT id, created_at FROM links ORDER BY created_at DESC').all();
+  const urls = [
+    { loc: `${baseDomain}/hub`, lastmod: new Date().toISOString() },
+    ...links.map(link => ({
+      loc: `${baseDomain}/go/${link.id}`,
+      lastmod: link.created_at || new Date().toISOString()
+    }))
+  ];
+
+  res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls.map(url => `  <url>
+    <loc>${escapeXml(url.loc)}</loc>
+    <lastmod>${escapeXml(url.lastmod)}</lastmod>
+  </url>`).join('\n')}
+</urlset>`);
+});
+
+app.get('/feed.xml', (req, res) => {
+  const baseDomain = getBaseDomain(req);
+  const links = db.prepare('SELECT * FROM links ORDER BY created_at DESC LIMIT 50').all();
+
+  res.type('application/rss+xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>CalHearing Index Hub</title>
+    <link>${escapeXml(`${baseDomain}/hub`)}</link>
+    <description>Recently submitted URLs for discovery.</description>
+${links.map(link => {
+  const redirectUrl = `${baseDomain}/go/${link.id}`;
+  return `    <item>
+      <title>${escapeXml(link.original_url)}</title>
+      <link>${escapeXml(redirectUrl)}</link>
+      <guid>${escapeXml(redirectUrl)}</guid>
+      <description>${escapeXml(link.original_url)}</description>
+      <pubDate>${new Date(link.created_at || Date.now()).toUTCString()}</pubDate>
+    </item>`;
+}).join('\n')}
+  </channel>
+</rss>`);
 });
 
 app.get('/login', (req, res) => {
@@ -1169,6 +1409,60 @@ app.post('/api/links/check-search-indexes', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to check search indexes: ' + err.message });
+  }
+});
+
+// POST /api/links/seo-check - Inspect the target page for common crawl/index blockers.
+app.post('/api/links/seo-check', async (req, res) => {
+  const { id } = req.body;
+
+  if (!id) {
+    return res.status(400).json({ error: 'A valid id is required.' });
+  }
+
+  try {
+    const selectStmt = db.prepare('SELECT * FROM links WHERE id = ?');
+    const link = selectStmt.get(id);
+
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found.' });
+    }
+
+    const report = await inspectTargetSeo(link.original_url);
+    const updateStmt = db.prepare(`
+      UPDATE links
+      SET seo_status = ?, seo_checked_at = ?, seo_report = ?
+      WHERE id = ?
+    `);
+    updateStmt.run(report.status, report.checkedAt, JSON.stringify(report), id);
+
+    res.json({
+      success: true,
+      id,
+      seoStatus: report.status,
+      seoCheckedAt: report.checkedAt,
+      report
+    });
+  } catch (err) {
+    const checkedAt = new Date().toISOString();
+    const report = {
+      status: SEO_STATUS.ERROR,
+      checkedAt,
+      issues: [err.message]
+    };
+    const updateStmt = db.prepare(`
+      UPDATE links
+      SET seo_status = ?, seo_checked_at = ?, seo_report = ?
+      WHERE id = ?
+    `);
+    updateStmt.run(SEO_STATUS.ERROR, checkedAt, JSON.stringify(report), id);
+
+    res.status(502).json({
+      error: err.message,
+      seoStatus: SEO_STATUS.ERROR,
+      seoCheckedAt: checkedAt,
+      report
+    });
   }
 });
 

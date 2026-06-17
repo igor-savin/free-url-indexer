@@ -32,6 +32,14 @@ const ENGINE_META = {
   Submitted: { label: 'Submitted', className: 'engine-submitted' },
   Failed: { label: 'Failed', className: 'engine-failed' }
 };
+const SEO_META = {
+  'Not Checked': { label: 'SEO: Not Checked', className: 'seo-unknown' },
+  Checking: { label: 'SEO: Checking', className: 'seo-checking' },
+  OK: { label: 'SEO: OK', className: 'seo-ok' },
+  Issues: { label: 'SEO: Issues', className: 'seo-issues' },
+  Blocked: { label: 'SEO: Blocked', className: 'seo-blocked' },
+  Error: { label: 'SEO: Error', className: 'seo-blocked' }
+};
 
 // Demo links matching the user's uploaded image!
 const DEMO_LINKS = [
@@ -270,6 +278,13 @@ function renderLinksTable() {
     const indexNowCheckedAt = link.indexnow_submitted_at
       ? new Date(link.indexnow_submitted_at).toLocaleString()
       : '';
+    const seoStatus = link.seo_status || 'Not Checked';
+    const seoMeta = SEO_META[seoStatus] || SEO_META['Not Checked'];
+    const seoReport = parseSeoReport(link.seo_report);
+    const seoCheckedAt = link.seo_checked_at
+      ? new Date(link.seo_checked_at).toLocaleString()
+      : '';
+    const seoTitle = buildSeoTitle(seoReport, seoCheckedAt);
 
     return `
       <tr data-id="${link.id}">
@@ -287,8 +302,13 @@ function renderLinksTable() {
               <span class="engine-badge ${bingMeta.className}" title="${indexNowCheckedAt ? `Submitted ${indexNowCheckedAt}` : ''}">B: ${bingMeta.label}</span>
               <span class="engine-badge ${yahooMeta.className}" title="${indexNowCheckedAt ? `Submitted via IndexNow ${indexNowCheckedAt}` : 'Yahoo is tracked through IndexNow sharing'}">Y: ${yahooMeta.label}</span>
             </div>
+            <div class="engine-line">
+              <span class="engine-badge ${seoMeta.className}" title="${seoTitle}">${seoMeta.label}</span>
+            </div>
+            ${seoReport?.issues?.length ? `<div class="status-error" title="${escapeAttribute(seoReport.issues.join(' | '))}">${escapeHtml(seoReport.issues[0])}</div>` : ''}
             <div class="index-actions">
               <button class="index-action-btn" onclick="checkSearchIndexStatus('${link.id}')" title="Check available Google, Bing, and Yahoo index signals">Check</button>
+              <button class="index-action-btn" onclick="checkTargetSeo('${link.id}')" title="Check whether the target page looks crawlable">SEO</button>
               <a class="index-action-link" href="${googleSearchUrl}" target="_blank" title="Open this search on Google">Open</a>
               <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Found')" title="Mark as found in Google">Found</button>
               <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Not Found')" title="Mark as not found in Google">Not Found</button>
@@ -633,6 +653,32 @@ async function checkSearchIndexStatus(id) {
   }
 }
 
+async function checkTargetSeo(id) {
+  try {
+    setLocalSeoStatus(id, 'Checking');
+
+    const res = await fetch('/api/links/seo-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Target page check failed.');
+
+    const issues = data.report?.issues || [];
+    if (issues.length > 0) {
+      showToast(`SEO check: ${data.seoStatus}. ${issues[0]}`, data.seoStatus === 'Blocked' ? 'error' : 'info');
+    } else {
+      showToast('SEO check passed. Target page looks crawlable.', 'success');
+    }
+    await fetchLinks();
+  } catch (err) {
+    showToast(err.message, 'error');
+    await fetchLinks();
+  }
+}
+
 function setLocalGoogleIndexStatus(id, googleIndexStatus) {
   links = links.map(link => {
     if (link.id !== id) return link;
@@ -644,9 +690,56 @@ function setLocalGoogleIndexStatus(id, googleIndexStatus) {
   renderLinksTable();
 }
 
+function setLocalSeoStatus(id, seoStatus) {
+  links = links.map(link => {
+    if (link.id !== id) return link;
+    return {
+      ...link,
+      seo_status: seoStatus
+    };
+  });
+  renderLinksTable();
+}
+
 // ----------------------------------------------------
 // UTILITIES (TOAST / COPY)
 // ----------------------------------------------------
+
+function parseSeoReport(rawReport) {
+  if (!rawReport) return null;
+  try {
+    return JSON.parse(rawReport);
+  } catch (err) {
+    return null;
+  }
+}
+
+function buildSeoTitle(report, checkedAt) {
+  const parts = [];
+  if (checkedAt) parts.push(`Checked ${checkedAt}`);
+  if (report?.httpStatus) parts.push(`HTTP ${report.httpStatus}`);
+  if (report?.title) parts.push(`Title: ${report.title}`);
+  if (report?.canonical) parts.push(`Canonical: ${report.canonical}`);
+  if (report?.issues?.length) parts.push(`Issues: ${report.issues.join(' | ')}`);
+  return parts.join(' · ');
+}
+
+function escapeAttribute(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function buildGoogleSearchUrl(url) {
   let query = url;
