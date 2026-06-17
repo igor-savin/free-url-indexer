@@ -557,6 +557,15 @@ tr:hover td {
   background: #cbd5e1;
 }
 
+.index-checking {
+  background: rgba(14, 165, 233, 0.12);
+  color: #38bdf8;
+}
+
+.index-checking::before {
+  background: #38bdf8;
+}
+
 .index-found {
   background: rgba(16, 185, 129, 0.12);
   color: #34d399;

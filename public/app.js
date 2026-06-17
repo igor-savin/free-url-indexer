@@ -22,8 +22,10 @@ const STATUS_META = {
 };
 const GOOGLE_INDEX_META = {
   'Not Checked': { label: 'Not Checked', className: 'index-unknown' },
+  Checking: { label: 'Checking', className: 'index-checking' },
   Found: { label: 'Found', className: 'index-found' },
-  'Not Found': { label: 'Not Found', className: 'index-not-found' }
+  'Not Found': { label: 'Not Found', className: 'index-not-found' },
+  'Check Failed': { label: 'Check Failed', className: 'index-not-found' }
 };
 
 // Demo links matching the user's uploaded image!
@@ -270,7 +272,8 @@ function renderLinksTable() {
           <div class="index-outcome">
             <span class="index-pill ${googleIndexMeta.className}" title="${googleCheckedAt ? `Checked ${googleCheckedAt}` : ''}">${googleIndexMeta.label}</span>
             <div class="index-actions">
-              <a class="index-action-link" href="${googleSearchUrl}" target="_blank" title="Search this URL on Google">Search</a>
+              <button class="index-action-btn" onclick="checkGoogleIndexStatus('${link.id}')" title="Automatically check Google results">Check</button>
+              <a class="index-action-link" href="${googleSearchUrl}" target="_blank" title="Open this search on Google">Open</a>
               <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Found')" title="Mark as found in Google">Found</button>
               <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Not Found')" title="Mark as not found in Google">Not Found</button>
             </div>
@@ -395,7 +398,7 @@ async function handleCheckStatus() {
   const idsToCheck = Array.from(selectedIds);
   btnCheckStatus.disabled = true;
   const originalText = btnCheckStatus.innerHTML;
-  btnCheckStatus.innerHTML = `<span class="btn-icon">⏳</span><div><strong>Verifying...</strong><small>Checking indexes</small></div>`;
+  btnCheckStatus.innerHTML = `<span class="btn-icon">⏳</span><div><strong>Verifying...</strong><small>Checking redirects</small></div>`;
 
   try {
     const res = await fetch('/api/check-status', {
@@ -584,6 +587,38 @@ async function updateGoogleIndexStatus(id, googleIndexStatus) {
   } catch (err) {
     showToast(err.message, 'error');
   }
+}
+
+async function checkGoogleIndexStatus(id) {
+  try {
+    setLocalGoogleIndexStatus(id, 'Checking');
+
+    const res = await fetch('/api/links/check-google-index', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Google index check failed.');
+
+    showToast(`Google index check complete: ${data.googleIndexStatus}.`, data.googleIndexStatus === 'Found' ? 'success' : 'info');
+    await fetchLinks();
+  } catch (err) {
+    showToast(err.message, 'error');
+    await fetchLinks();
+  }
+}
+
+function setLocalGoogleIndexStatus(id, googleIndexStatus) {
+  links = links.map(link => {
+    if (link.id !== id) return link;
+    return {
+      ...link,
+      google_index_status: googleIndexStatus
+    };
+  });
+  renderLinksTable();
 }
 
 // ----------------------------------------------------

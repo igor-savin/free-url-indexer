@@ -42,6 +42,12 @@ const STATUS = {
   TARGET_REACHABLE: 'Target Reachable',
   VERIFICATION_FAILED: 'Verification Failed'
 };
+const GOOGLE_INDEX_STATUS = {
+  NOT_CHECKED: 'Not Checked',
+  FOUND: 'Found',
+  NOT_FOUND: 'Not Found',
+  CHECK_FAILED: 'Check Failed'
+};
 
 function parseServiceAccountJson(rawJson) {
   const parsedKey = JSON.parse(rawJson);
@@ -203,6 +209,67 @@ async function fetchWithFallback(url) {
   } catch (headError) {
     return fetch(url, { ...requestOptions, method: 'GET' });
   }
+}
+
+function buildGoogleIndexQuery(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return `site:${parsedUrl.hostname}${parsedUrl.pathname}`;
+  } catch (err) {
+    return `site:${url}`;
+  }
+}
+
+function normalizeUrlForSearch(url) {
+  try {
+    const parsedUrl = new URL(url);
+    const pathname = parsedUrl.pathname.replace(/\/$/, '');
+    return `${parsedUrl.hostname}${pathname}`.toLowerCase();
+  } catch (err) {
+    return url.toLowerCase();
+  }
+}
+
+async function checkGoogleIndexForUrl(url) {
+  const query = buildGoogleIndexQuery(url);
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=10&hl=en`;
+  const response = await fetch(searchUrl, {
+    headers: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Google search returned HTTP ${response.status}.`);
+  }
+
+  const html = await response.text();
+  const normalizedTarget = normalizeUrlForSearch(url);
+  const normalizedHtml = html
+    .replace(/&amp;/g, '&')
+    .replace(/\\u003d/g, '=')
+    .replace(/\\u0026/g, '&')
+    .toLowerCase();
+
+  if (
+    normalizedHtml.includes('/sorry/') ||
+    normalizedHtml.includes('unusual traffic') ||
+    normalizedHtml.includes('our systems have detected')
+  ) {
+    throw new Error('Google blocked the automated check. Use the Search link to verify manually.');
+  }
+
+  const found = normalizedHtml.includes(normalizedTarget);
+  const noResults = normalizedHtml.includes('did not match any documents') ||
+    normalizedHtml.includes('make sure that all words are spelled correctly');
+
+  return {
+    found,
+    query,
+    searchUrl,
+    signal: found ? 'target-url-found-in-results-html' : (noResults ? 'google-no-results-message' : 'target-url-not-found-in-results-html')
+  };
 }
 
 // ----------------------------------------------------
@@ -547,14 +614,19 @@ app.post('/api/check-status', async (req, res) => {
 // POST /api/links/index-status - Manually track whether Google currently shows the target URL.
 app.post('/api/links/index-status', (req, res) => {
   const { id, googleIndexStatus } = req.body;
-  const allowedStatuses = new Set(['Not Checked', 'Found', 'Not Found']);
+  const allowedStatuses = new Set([
+    GOOGLE_INDEX_STATUS.NOT_CHECKED,
+    GOOGLE_INDEX_STATUS.FOUND,
+    GOOGLE_INDEX_STATUS.NOT_FOUND,
+    GOOGLE_INDEX_STATUS.CHECK_FAILED
+  ]);
 
   if (!id || !allowedStatuses.has(googleIndexStatus)) {
     return res.status(400).json({ error: 'A valid id and googleIndexStatus are required.' });
   }
 
   try {
-    const checkedAt = googleIndexStatus === 'Not Checked' ? null : new Date().toISOString();
+    const checkedAt = googleIndexStatus === GOOGLE_INDEX_STATUS.NOT_CHECKED ? null : new Date().toISOString();
     const stmt = db.prepare(`
       UPDATE links
       SET google_index_status = ?, google_index_checked_at = ?
@@ -574,6 +646,60 @@ app.post('/api/links/index-status', (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update Google index status: ' + err.message });
+  }
+});
+
+// POST /api/links/check-google-index - Best-effort automatic Google result check.
+app.post('/api/links/check-google-index', async (req, res) => {
+  const { id } = req.body;
+
+  if (!id) {
+    return res.status(400).json({ error: 'A valid id is required.' });
+  }
+
+  try {
+    const selectStmt = db.prepare('SELECT * FROM links WHERE id = ?');
+    const link = selectStmt.get(id);
+
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found.' });
+    }
+
+    const result = await checkGoogleIndexForUrl(link.original_url);
+    const googleIndexStatus = result.found
+      ? GOOGLE_INDEX_STATUS.FOUND
+      : GOOGLE_INDEX_STATUS.NOT_FOUND;
+    const checkedAt = new Date().toISOString();
+    const updateStmt = db.prepare(`
+      UPDATE links
+      SET google_index_status = ?, google_index_checked_at = ?
+      WHERE id = ?
+    `);
+    updateStmt.run(googleIndexStatus, checkedAt, id);
+
+    res.json({
+      success: true,
+      id,
+      googleIndexStatus,
+      googleIndexCheckedAt: checkedAt,
+      query: result.query,
+      searchUrl: result.searchUrl,
+      signal: result.signal
+    });
+  } catch (err) {
+    const checkedAt = new Date().toISOString();
+    const updateStmt = db.prepare(`
+      UPDATE links
+      SET google_index_status = ?, google_index_checked_at = ?
+      WHERE id = ?
+    `);
+    updateStmt.run(GOOGLE_INDEX_STATUS.CHECK_FAILED, checkedAt, id);
+
+    res.status(502).json({
+      error: err.message,
+      googleIndexStatus: GOOGLE_INDEX_STATUS.CHECK_FAILED,
+      googleIndexCheckedAt: checkedAt
+    });
   }
 });
 
