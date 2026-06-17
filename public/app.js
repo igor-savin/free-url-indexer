@@ -20,6 +20,11 @@ const STATUS_META = {
   Indexed: { label: 'Target Reachable', className: 'badge-target-reachable' },
   'Verification Failed': { label: 'Verification Failed', className: 'badge-failed' }
 };
+const GOOGLE_INDEX_META = {
+  'Not Checked': { label: 'Not Checked', className: 'index-unknown' },
+  Found: { label: 'Found', className: 'index-found' },
+  'Not Found': { label: 'Not Found', className: 'index-not-found' }
+};
 
 // Demo links matching the user's uploaded image!
 const DEMO_LINKS = [
@@ -231,7 +236,7 @@ function renderLinksTable() {
   if (filteredLinks.length === 0) {
     linksTbody.innerHTML = `
       <tr>
-        <td colspan="6" class="table-empty">
+        <td colspan="7" class="table-empty">
           ${query ? 'No matching links found.' : 'Your indexing queue is empty. Submit some links above!'}
         </td>
       </tr>
@@ -245,6 +250,12 @@ function renderLinksTable() {
     const formattedDate = new Date(link.created_at).toLocaleString();
     
     const statusMeta = STATUS_META[link.status] || { label: link.status || 'Unknown', className: 'badge-queued' };
+    const googleIndexStatus = link.google_index_status || 'Not Checked';
+    const googleIndexMeta = GOOGLE_INDEX_META[googleIndexStatus] || GOOGLE_INDEX_META['Not Checked'];
+    const googleCheckedAt = link.google_index_checked_at
+      ? new Date(link.google_index_checked_at).toLocaleString()
+      : '';
+    const googleSearchUrl = buildGoogleSearchUrl(link.original_url);
 
     return `
       <tr data-id="${link.id}">
@@ -254,6 +265,16 @@ function renderLinksTable() {
         <td>
             <span class="badge ${statusMeta.className}" title="${link.last_error || ''}">${statusMeta.label}</span>
             ${link.last_error ? `<div class="status-error" title="${link.last_error}">${link.last_error}</div>` : ''}
+        </td>
+        <td>
+          <div class="index-outcome">
+            <span class="index-pill ${googleIndexMeta.className}" title="${googleCheckedAt ? `Checked ${googleCheckedAt}` : ''}">${googleIndexMeta.label}</span>
+            <div class="index-actions">
+              <a class="index-action-link" href="${googleSearchUrl}" target="_blank" title="Search this URL on Google">Search</a>
+              <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Found')" title="Mark as found in Google">Found</button>
+              <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Not Found')" title="Mark as not found in Google">Not Found</button>
+            </div>
+          </div>
         </td>
         <td>
           <div class="link-display">
@@ -547,9 +568,39 @@ async function deleteSingleLink(id) {
   }
 }
 
+async function updateGoogleIndexStatus(id, googleIndexStatus) {
+  try {
+    const res = await fetch('/api/links/index-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, googleIndexStatus })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to update Google index flag.');
+
+    showToast(`Google index flag marked: ${googleIndexStatus}.`, 'success');
+    await fetchLinks();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
 // ----------------------------------------------------
 // UTILITIES (TOAST / COPY)
 // ----------------------------------------------------
+
+function buildGoogleSearchUrl(url) {
+  let query = url;
+  try {
+    const parsedUrl = new URL(url);
+    query = `site:${parsedUrl.hostname}${parsedUrl.pathname}`;
+  } catch (err) {
+    query = `site:${url}`;
+  }
+
+  return `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+}
 
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text).then(() => {

@@ -87,12 +87,30 @@ try {
       created_at TEXT,
       submitted_at TEXT,
       indexed_at TEXT,
-      last_error TEXT
+      last_error TEXT,
+      google_index_status TEXT DEFAULT 'Not Checked',
+      google_index_checked_at TEXT
     )
   `);
 
   try {
     db.exec('ALTER TABLE links ADD COLUMN last_error TEXT');
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec("ALTER TABLE links ADD COLUMN google_index_status TEXT DEFAULT 'Not Checked'");
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
+
+  try {
+    db.exec('ALTER TABLE links ADD COLUMN google_index_checked_at TEXT');
   } catch (err) {
     if (!String(err.message).includes('duplicate column name')) {
       throw err;
@@ -523,6 +541,39 @@ app.post('/api/check-status', async (req, res) => {
     res.json({ success: true, results });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update link status: ' + err.message });
+  }
+});
+
+// POST /api/links/index-status - Manually track whether Google currently shows the target URL.
+app.post('/api/links/index-status', (req, res) => {
+  const { id, googleIndexStatus } = req.body;
+  const allowedStatuses = new Set(['Not Checked', 'Found', 'Not Found']);
+
+  if (!id || !allowedStatuses.has(googleIndexStatus)) {
+    return res.status(400).json({ error: 'A valid id and googleIndexStatus are required.' });
+  }
+
+  try {
+    const checkedAt = googleIndexStatus === 'Not Checked' ? null : new Date().toISOString();
+    const stmt = db.prepare(`
+      UPDATE links
+      SET google_index_status = ?, google_index_checked_at = ?
+      WHERE id = ?
+    `);
+    const result = stmt.run(googleIndexStatus, checkedAt, id);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Link not found.' });
+    }
+
+    res.json({
+      success: true,
+      id,
+      googleIndexStatus,
+      googleIndexCheckedAt: checkedAt
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update Google index status: ' + err.message });
   }
 });
 
