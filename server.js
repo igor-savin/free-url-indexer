@@ -34,6 +34,14 @@ console.log(`[Storage] Using data directory: ${DATA_DIR}`);
 
 const DB_PATH = path.join(DATA_DIR, 'indexer.db');
 const KEY_FILE = path.join(DATA_DIR, 'service_account.json');
+const STATUS = {
+  QUEUED: 'Queued',
+  GOOGLE_ACCEPTED: 'Google Accepted',
+  SUBMISSION_FAILED: 'Submission Failed',
+  REDIRECT_VERIFIED: 'Redirect Verified',
+  TARGET_REACHABLE: 'Target Reachable',
+  VERIFICATION_FAILED: 'Verification Failed'
+};
 
 function parseServiceAccountJson(rawJson) {
   const parsedKey = JSON.parse(rawJson);
@@ -75,7 +83,7 @@ try {
     CREATE TABLE IF NOT EXISTS links (
       id TEXT PRIMARY KEY,
       original_url TEXT UNIQUE,
-      status TEXT DEFAULT 'Pending',
+      status TEXT DEFAULT 'Queued',
       created_at TEXT,
       submitted_at TEXT,
       indexed_at TEXT,
@@ -90,6 +98,18 @@ try {
       throw err;
     }
   }
+
+  db.exec(`
+    UPDATE links
+    SET status = CASE status
+      WHEN 'Pending' THEN 'Queued'
+      WHEN 'Submitted' THEN 'Google Accepted'
+      WHEN 'Failed' THEN 'Submission Failed'
+      WHEN 'Crawled' THEN 'Redirect Verified'
+      WHEN 'Indexed' THEN 'Target Reachable'
+      ELSE status
+    END
+  `);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
@@ -151,6 +171,20 @@ function getBaseDomain(req) {
   }
 
   return savedBaseDomain || `http://localhost:${PORT}`;
+}
+
+async function fetchWithFallback(url) {
+  const requestOptions = {
+    headers: {
+      'User-Agent': 'CalHearingIndexer/1.0 (+https://link.calhearing.com)'
+    }
+  };
+
+  try {
+    return await fetch(url, { ...requestOptions, method: 'HEAD' });
+  } catch (headError) {
+    return fetch(url, { ...requestOptions, method: 'GET' });
+  }
 }
 
 // ----------------------------------------------------
@@ -216,7 +250,7 @@ app.post('/api/submit', (req, res) => {
   const results = [];
   const insertStmt = db.prepare(`
     INSERT INTO links (id, original_url, status, created_at)
-    VALUES (?, ?, 'Pending', ?)
+    VALUES (?, ?, ?, ?)
   `);
 
   const selectStmt = db.prepare('SELECT id, original_url, status, created_at FROM links WHERE original_url = ?');
@@ -256,12 +290,12 @@ app.post('/api/submit', (req, res) => {
     const now = new Date().toISOString();
 
     try {
-      insertStmt.run(shortId, url, now);
+      insertStmt.run(shortId, url, STATUS.QUEUED, now);
       results.push({
         url,
         shortId,
         redirectUrl: `${baseDomain}/go/${shortId}`,
-        status: 'Pending',
+        status: STATUS.QUEUED,
         success: true
       });
     } catch (err) {
@@ -347,9 +381,12 @@ app.post('/api/trigger', async (req, res) => {
       const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
       linksToProcess = stmt.all(...ids);
     } else {
-      // Submit all pending/failed ones
-      const stmt = db.prepare(`SELECT * FROM links WHERE status != 'Crawled' AND status != 'Indexed'`);
-      linksToProcess = stmt.all();
+      // Submit links that have not already been accepted by Google.
+      const stmt = db.prepare(`
+        SELECT * FROM links
+        WHERE status IN (?, ?, ?, 'Pending', 'Failed')
+      `);
+      linksToProcess = stmt.all(STATUS.QUEUED, STATUS.SUBMISSION_FAILED, STATUS.VERIFICATION_FAILED);
     }
   } catch (err) {
     return res.status(500).json({ error: 'Failed to query database: ' + err.message });
@@ -394,19 +431,19 @@ app.post('/api/trigger', async (req, res) => {
       });
       
       if (response.status === 200) {
-        updateStmt.run('Submitted', now, null, link.id);
-        results.push({ id: link.id, url: redirectUrl, success: true, status: 'Submitted' });
+        updateStmt.run(STATUS.GOOGLE_ACCEPTED, now, null, link.id);
+        results.push({ id: link.id, url: redirectUrl, success: true, status: STATUS.GOOGLE_ACCEPTED });
       } else {
         const errorMessage = `Google API returned status ${response.status}`;
-        updateStmt.run('Failed', now, errorMessage, link.id);
-        results.push({ id: link.id, url: redirectUrl, success: false, error: `Google API returned status ${response.status}`, status: 'Failed' });
+        updateStmt.run(STATUS.SUBMISSION_FAILED, now, errorMessage, link.id);
+        results.push({ id: link.id, url: redirectUrl, success: false, error: errorMessage, status: STATUS.SUBMISSION_FAILED });
       }
     } catch (error) {
       const errMsg = error.response && error.response.data && error.response.data.error
         ? error.response.data.error.message
         : error.message;
-      updateStmt.run('Failed', now, errMsg, link.id);
-      results.push({ id: link.id, url: redirectUrl, success: false, error: errMsg, status: 'Failed' });
+      updateStmt.run(STATUS.SUBMISSION_FAILED, now, errMsg, link.id);
+      results.push({ id: link.id, url: redirectUrl, success: false, error: errMsg, status: STATUS.SUBMISSION_FAILED });
     }
 
     // Short sleep to respect rate limits
@@ -416,8 +453,8 @@ app.post('/api/trigger', async (req, res) => {
   res.json({ success: true, processedCount: linksToProcess.length, results });
 });
 
-// POST /api/check-status - Simulate or check if indexing was successful
-app.post('/api/check-status', (req, res) => {
+// POST /api/check-status - Verify redirect and target reachability.
+app.post('/api/check-status', async (req, res) => {
   const { ids } = req.body;
   
   try {
@@ -427,7 +464,7 @@ app.post('/api/check-status', (req, res) => {
       const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
       linksToCheck = stmt.all(...ids);
     } else {
-      const stmt = db.prepare("SELECT * FROM links WHERE status = 'Submitted' OR status = 'Pending' OR status = 'Failed'");
+      const stmt = db.prepare('SELECT * FROM links');
       linksToCheck = stmt.all();
     }
 
@@ -435,29 +472,52 @@ app.post('/api/check-status', (req, res) => {
       return res.json({ success: true, message: 'No links need a status check.' });
     }
 
-    const updateStmt = db.prepare('UPDATE links SET status = ?, indexed_at = ? WHERE id = ?');
+    const updateStmt = db.prepare('UPDATE links SET status = ?, indexed_at = ?, last_error = ? WHERE id = ?');
     const now = new Date().toISOString();
     const results = [];
+    const baseDomain = getBaseDomain(req);
 
-    // Since programmatically checking external search results without getting Google blocked is hard,
-    // we check if they have been submitted. For this tool, we simulate indexing transition
-    // (e.g. 50% chance to mock success to show UI feedback, or transitioning "Submitted" to "Indexed").
-    // In a production app, we would scrape or use custom search JSON API, but that requires paid API keys.
-    // We will simulate it and display it beautifully!
     for (const link of linksToCheck) {
-      let nextStatus = link.status;
-      if (link.status === 'Submitted') {
-        // Mock successful crawler discovery
-        const rand = Math.random();
-        if (rand > 0.4) {
-          nextStatus = 'Indexed';
-        } else if (rand > 0.1) {
-          nextStatus = 'Crawled'; // Google bot visited but not indexed yet
+      const redirectUrl = `${baseDomain}/go/${link.id}`;
+      let nextStatus = STATUS.REDIRECT_VERIFIED;
+      let lastError = null;
+      let targetStatus = null;
+
+      try {
+        const redirectResponse = await fetch(redirectUrl, {
+          method: 'HEAD',
+          redirect: 'manual'
+        });
+        const location = redirectResponse.headers.get('location');
+        const redirectWorks = [301, 302, 307, 308].includes(redirectResponse.status) && location;
+
+        if (!redirectWorks) {
+          throw new Error(`Redirect check failed: expected 301/302, got HTTP ${redirectResponse.status}.`);
         }
+
+        const targetResponse = await fetchWithFallback(link.original_url);
+        targetStatus = targetResponse.status;
+
+        if (targetStatus >= 200 && targetStatus < 500) {
+          nextStatus = STATUS.TARGET_REACHABLE;
+        } else {
+          nextStatus = STATUS.REDIRECT_VERIFIED;
+          lastError = `Redirect works, but target returned HTTP ${targetStatus}.`;
+        }
+      } catch (err) {
+        nextStatus = STATUS.VERIFICATION_FAILED;
+        lastError = err.message;
       }
       
-      updateStmt.run(nextStatus, nextStatus === 'Indexed' ? now : null, link.id);
-      results.push({ id: link.id, original_url: link.original_url, status: nextStatus });
+      updateStmt.run(nextStatus, now, lastError, link.id);
+      results.push({
+        id: link.id,
+        original_url: link.original_url,
+        redirect_url: redirectUrl,
+        target_status: targetStatus,
+        status: nextStatus,
+        error: lastError
+      });
     }
 
     res.json({ success: true, results });

@@ -7,6 +7,19 @@ let appSettings = {
   gcpKeySource: null
 };
 let selectedIds = new Set();
+const STATUS_META = {
+  Queued: { label: 'Queued', className: 'badge-queued' },
+  Pending: { label: 'Queued', className: 'badge-queued' },
+  'Google Accepted': { label: 'Google Accepted', className: 'badge-google-accepted' },
+  Submitted: { label: 'Google Accepted', className: 'badge-google-accepted' },
+  'Submission Failed': { label: 'Submission Failed', className: 'badge-failed' },
+  Failed: { label: 'Submission Failed', className: 'badge-failed' },
+  'Redirect Verified': { label: 'Redirect Verified', className: 'badge-redirect-verified' },
+  Crawled: { label: 'Redirect Verified', className: 'badge-redirect-verified' },
+  'Target Reachable': { label: 'Target Reachable', className: 'badge-target-reachable' },
+  Indexed: { label: 'Target Reachable', className: 'badge-target-reachable' },
+  'Verification Failed': { label: 'Verification Failed', className: 'badge-failed' }
+};
 
 // Demo links matching the user's uploaded image!
 const DEMO_LINKS = [
@@ -198,9 +211,9 @@ async function fetchSettings() {
 
 function updateStats() {
   const total = links.length;
-  const pending = links.filter(l => l.status === 'Pending').length;
-  const submitted = links.filter(l => l.status === 'Submitted' || l.status === 'Crawled').length;
-  const indexed = links.filter(l => l.status === 'Indexed').length;
+  const pending = links.filter(l => ['Queued', 'Pending'].includes(l.status)).length;
+  const submitted = links.filter(l => ['Google Accepted', 'Submitted'].includes(l.status)).length;
+  const indexed = links.filter(l => ['Target Reachable', 'Indexed'].includes(l.status)).length;
 
   statTotal.textContent = total;
   statPending.textContent = pending;
@@ -231,12 +244,7 @@ function renderLinksTable() {
     const redirectUrl = `${appSettings.baseDomain || 'http://localhost:3000'}/go/${link.id}`;
     const formattedDate = new Date(link.created_at).toLocaleString();
     
-    // Determine status badge class
-    let badgeClass = 'badge-pending';
-    if (link.status === 'Submitted') badgeClass = 'badge-submitted';
-    if (link.status === 'Crawled') badgeClass = 'badge-crawled';
-    if (link.status === 'Indexed') badgeClass = 'badge-indexed';
-    if (link.status === 'Failed') badgeClass = 'badge-failed';
+    const statusMeta = STATUS_META[link.status] || { label: link.status || 'Unknown', className: 'badge-queued' };
 
     return `
       <tr data-id="${link.id}">
@@ -244,7 +252,7 @@ function renderLinksTable() {
           <input type="checkbox" class="link-select-checkbox" data-id="${link.id}" ${isChecked ? 'checked' : ''}>
         </td>
         <td>
-            <span class="badge ${badgeClass}" title="${link.last_error || ''}">${link.status}</span>
+            <span class="badge ${statusMeta.className}" title="${link.last_error || ''}">${statusMeta.label}</span>
             ${link.last_error ? `<div class="status-error" title="${link.last_error}">${link.last_error}</div>` : ''}
         </td>
         <td>
@@ -324,7 +332,7 @@ async function handleTriggerIndexing() {
   const idsToTrigger = Array.from(selectedIds);
   const isAll = idsToTrigger.length === 0;
 
-  if (isAll && !confirm('No rows selected. Trigger Google Indexing API for ALL pending/failed links in queue?')) {
+  if (isAll && !confirm('No rows selected. Submit all queued/failed links to Google?')) {
     return;
   }
 
@@ -378,7 +386,7 @@ async function handleCheckStatus() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Verification check failed.');
 
-    showToast(`Verification complete. Updated crawl status for link queue.`, 'success');
+    showToast(`Verification complete. Updated redirect and target health.`, 'success');
     
     // Clear selection
     selectedIds.clear();
