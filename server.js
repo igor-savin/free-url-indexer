@@ -3,6 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const session = require('express-session');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const { DatabaseSync } = require('node:sqlite');
 const { google } = require('googleapis');
 
@@ -34,6 +37,13 @@ console.log(`[Storage] Using data directory: ${DATA_DIR}`);
 
 const DB_PATH = path.join(DATA_DIR, 'indexer.db');
 const KEY_FILE = path.join(DATA_DIR, 'service_account.json');
+const AUTH_BASE_URL = (process.env.AUTH_BASE_URL || process.env.BASE_DOMAIN || '').replace(/\/$/, '');
+const AUTH_ENABLED = Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const ALLOWED_GOOGLE_EMAILS = (process.env.ALLOWED_GOOGLE_EMAILS || '')
+  .split(',')
+  .map(email => email.trim().toLowerCase())
+  .filter(Boolean);
 const STATUS = {
   QUEUED: 'Queued',
   GOOGLE_ACCEPTED: 'Google Accepted',
@@ -42,6 +52,14 @@ const STATUS = {
   TARGET_REACHABLE: 'Target Reachable',
   VERIFICATION_FAILED: 'Verification Failed'
 };
+
+if (!process.env.SESSION_SECRET) {
+  console.warn('[Auth] SESSION_SECRET is not set. Sessions will reset when the app restarts.');
+}
+
+if (!AUTH_ENABLED) {
+  console.warn('[Auth] Google login is disabled until GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set.');
+}
 const GOOGLE_INDEX_STATUS = {
   NOT_CHECKED: 'Not Checked',
   FOUND: 'Found',
@@ -77,7 +95,55 @@ function getServiceAccountKey() {
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.set('trust proxy', 1);
+app.use(session({
+  name: 'indexer.sid',
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 7 * 24 * 60 * 60 * 1000
+  }
+}));
+app.use(passport.initialize());
+app.use(passport.session());
+
+passport.serializeUser((user, done) => {
+  done(null, user);
+});
+
+passport.deserializeUser((user, done) => {
+  done(null, user);
+});
+
+if (AUTH_ENABLED) {
+  passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: AUTH_BASE_URL ? `${AUTH_BASE_URL}/auth/google/callback` : '/auth/google/callback'
+  }, (accessToken, refreshToken, profile, done) => {
+    const email = profile.emails && profile.emails[0] && profile.emails[0].value
+      ? profile.emails[0].value.toLowerCase()
+      : null;
+
+    if (!email) {
+      return done(null, false, { message: 'Google account did not provide an email address.' });
+    }
+
+    if (ALLOWED_GOOGLE_EMAILS.length > 0 && !ALLOWED_GOOGLE_EMAILS.includes(email)) {
+      return done(null, false, { message: `${email} is not allowed to access this dashboard.` });
+    }
+
+    return done(null, {
+      id: profile.id,
+      email,
+      name: profile.displayName || email
+    });
+  }));
+}
 
 // Initialize SQLite database using Node's native DatabaseSync
 let db;
@@ -272,6 +338,56 @@ async function checkGoogleIndexForUrl(url) {
   };
 }
 
+function isLoggedIn(req) {
+  return !AUTH_ENABLED || (req.isAuthenticated && req.isAuthenticated());
+}
+
+function requireAuth(req, res, next) {
+  if (isLoggedIn(req)) return next();
+
+  if (req.path.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Login required.' });
+  }
+
+  return res.redirect('/login');
+}
+
+function renderLoginPage(errorMessage = '') {
+  const escapedError = errorMessage
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in | URL Indexer</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #070913; color: #f8fafc; }
+    .panel { width: min(420px, calc(100vw - 32px)); border: 1px solid rgba(255,255,255,.1); border-radius: 14px; padding: 30px; background: rgba(13,17,30,.72); box-shadow: 0 24px 80px rgba(0,0,0,.45); }
+    h1 { margin: 0 0 8px; font-size: 1.5rem; }
+    p { margin: 0 0 22px; color: #94a3b8; line-height: 1.5; }
+    a.button { display: inline-flex; align-items: center; justify-content: center; width: 100%; min-height: 44px; border-radius: 8px; background: #fff; color: #111827; font-weight: 700; text-decoration: none; }
+    .error { margin-top: 16px; color: #fca5a5; font-size: .9rem; }
+    .disabled { color: #fca5a5; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>Sign in to URL Indexer</h1>
+    <p>This dashboard is private. Use your allowed Google account to continue.</p>
+    ${AUTH_ENABLED
+      ? '<a class="button" href="/auth/google">Continue with Google</a>'
+      : '<p class="disabled">Google login is not configured yet. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Render.</p>'}
+    ${escapedError ? `<div class="error">${escapedError}</div>` : ''}
+  </main>
+</body>
+</html>`;
+}
+
 // ----------------------------------------------------
 // 1. REDIRECT GATEWAY ROUTE
 // ----------------------------------------------------
@@ -310,9 +426,62 @@ app.get('/google:hash.html', (req, res) => {
   res.send(`google-site-verification: google${req.params.hash}.html`);
 });
 
+app.get('/login', (req, res) => {
+  if (isLoggedIn(req)) return res.redirect('/');
+  return res.send(renderLoginPage(req.query.error ? String(req.query.error) : ''));
+});
+
+app.get('/auth/google', (req, res, next) => {
+  if (!AUTH_ENABLED) return res.redirect('/login?error=Google%20login%20is%20not%20configured.');
+  return passport.authenticate('google', {
+    scope: ['profile', 'email'],
+    prompt: 'select_account'
+  })(req, res, next);
+});
+
+app.get('/auth/google/callback', (req, res, next) => {
+  if (!AUTH_ENABLED) return res.redirect('/login?error=Google%20login%20is%20not%20configured.');
+
+  return passport.authenticate('google', (err, user, info) => {
+    if (err) return next(err);
+    if (!user) {
+      const message = info && info.message ? info.message : 'Google login was denied.';
+      return res.redirect(`/login?error=${encodeURIComponent(message)}`);
+    }
+
+    return req.logIn(user, loginErr => {
+      if (loginErr) return next(loginErr);
+      return res.redirect('/');
+    });
+  })(req, res, next);
+});
+
+app.get('/logout', (req, res, next) => {
+  if (!req.logout) return res.redirect('/login');
+
+  req.logout(err => {
+    if (err) return next(err);
+    req.session.destroy(() => {
+      res.clearCookie('indexer.sid');
+      res.redirect('/login');
+    });
+  });
+});
+
+app.use(requireAuth);
+app.use(express.static(path.join(__dirname, 'public')));
+
 // ----------------------------------------------------
 // 2. API ENDPOINTS
 // ----------------------------------------------------
+
+app.get('/api/me', (req, res) => {
+  res.json({
+    authenticated: isLoggedIn(req),
+    user: req.user || null,
+    authEnabled: AUTH_ENABLED
+  });
+});
 
 // GET /api/links - Get all links
 app.get('/api/links', (req, res) => {

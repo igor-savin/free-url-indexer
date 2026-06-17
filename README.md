@@ -51,9 +51,19 @@ Set these in **Render > Your Web Service > Environment**:
 ```text
 BASE_DOMAIN=https://link.calhearing.com
 GOOGLE_SERVICE_ACCOUNT_JSON={paste the full service account JSON here}
+GOOGLE_CLIENT_ID={Google OAuth web client ID}
+GOOGLE_CLIENT_SECRET={Google OAuth web client secret}
+SESSION_SECRET={a long random string}
+ALLOWED_GOOGLE_EMAILS=you@example.com
 ```
 
 `DATA_DIR` is optional. On Render's free plan, do not set it to `/var/data` unless you have attached a persistent disk.
+
+For Google login, create an OAuth 2.0 **Web application** client in Google Cloud and add this authorized redirect URI:
+
+```text
+https://link.calhearing.com/auth/google/callback
+```
 
 ---
 
