@@ -50,7 +50,6 @@ const urlForm = document.getElementById('url-submit-form');
 const btnSubmitUrls = document.getElementById('btn-submit-urls');
 const btnLoadDemo = document.getElementById('btn-load-demo');
 const btnTriggerIndexing = document.getElementById('btn-trigger-indexing');
-const btnTriggerIndexNow = document.getElementById('btn-trigger-indexnow');
 const btnCheckStatus = document.getElementById('btn-check-status');
 const searchInput = document.getElementById('search-input');
 const btnDeleteSelected = document.getElementById('btn-delete-selected');
@@ -119,7 +118,6 @@ function setupEventListeners() {
 
   // Actions
   btnTriggerIndexing.addEventListener('click', handleTriggerIndexing);
-  btnTriggerIndexNow.addEventListener('click', handleTriggerIndexNow);
   btnCheckStatus.addEventListener('click', handleCheckStatus);
 }
 
@@ -290,7 +288,7 @@ function renderLinksTable() {
               <span class="engine-badge ${yahooMeta.className}" title="${indexNowCheckedAt ? `Submitted via IndexNow ${indexNowCheckedAt}` : 'Yahoo is tracked through IndexNow sharing'}">Y: ${yahooMeta.label}</span>
             </div>
             <div class="index-actions">
-              <button class="index-action-btn" onclick="checkGoogleIndexStatus('${link.id}')" title="Automatically check Google results">Check</button>
+              <button class="index-action-btn" onclick="checkSearchIndexStatus('${link.id}')" title="Check available Google, Bing, and Yahoo index signals">Check</button>
               <a class="index-action-link" href="${googleSearchUrl}" target="_blank" title="Open this search on Google">Open</a>
               <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Found')" title="Mark as found in Google">Found</button>
               <button class="index-action-btn" onclick="updateGoogleIndexStatus('${link.id}', 'Not Found')" title="Mark as not found in Google">Not Found</button>
@@ -374,29 +372,33 @@ async function handleTriggerIndexing() {
   const idsToTrigger = Array.from(selectedIds);
   const isAll = idsToTrigger.length === 0;
 
-  if (isAll && !confirm('No rows selected. Submit all queued/failed links to Google?')) {
+  if (isAll && !confirm('No rows selected. Submit all queued/failed links to Google, Bing, and Yahoo?')) {
     return;
   }
 
   btnTriggerIndexing.disabled = true;
   const originalText = btnTriggerIndexing.innerHTML;
-  btnTriggerIndexing.innerHTML = `<span class="btn-icon">⏳</span><div><strong>Submitting...</strong><small>Calling Google APIs</small></div>`;
+  btnTriggerIndexing.innerHTML = `<span class="btn-icon">⏳</span><div><strong>Submitting...</strong><small>Calling search engines</small></div>`;
 
   try {
-    const res = await fetch('/api/trigger', {
+    const res = await fetch('/api/trigger-all', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: idsToTrigger })
     });
 
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Trigger failed.');
+    if (!res.ok && res.status !== 207) throw new Error(data.error || 'Trigger failed.');
 
-    const failedResults = (data.results || []).filter(result => !result.success);
-    if (failedResults.length > 0) {
-      showToast(`${failedResults.length} submission(s) failed. Open the row status for details.`, 'error');
+    const googleFailures = (data.google?.results || []).filter(result => !result.success).length;
+    const indexNowFailures = (data.indexNow?.results || []).filter(result => !result.success).length;
+    const googleCount = data.google?.processedCount || 0;
+    const indexNowCount = data.indexNow?.processedCount || 0;
+
+    if (googleFailures > 0 || indexNowFailures > 0 || data.google?.error || data.indexNow?.error) {
+      showToast(`Submitted with warnings. Google: ${googleCount}, Bing/Yahoo: ${indexNowCount}.`, 'error');
     } else {
-      showToast(`Submissions complete. Google APIs returned code 200 for ${data.processedCount} link(s).`, 'success');
+      showToast(`Submitted to search engines. Google: ${googleCount}, Bing/Yahoo: ${indexNowCount}.`, 'success');
     }
     
     // Clear selection
@@ -409,43 +411,6 @@ async function handleTriggerIndexing() {
   } finally {
     btnTriggerIndexing.disabled = false;
     btnTriggerIndexing.innerHTML = originalText;
-  }
-}
-
-async function handleTriggerIndexNow() {
-  const idsToTrigger = Array.from(selectedIds);
-  const isAll = idsToTrigger.length === 0;
-
-  if (isAll && !confirm('No rows selected. Submit all not-yet-submitted/failed links to Bing/Yahoo via IndexNow?')) {
-    return;
-  }
-
-  btnTriggerIndexNow.disabled = true;
-  const originalText = btnTriggerIndexNow.innerHTML;
-  btnTriggerIndexNow.innerHTML = `<span class="btn-icon">⏳</span><div><strong>Submitting...</strong><small>Calling IndexNow</small></div>`;
-
-  try {
-    const res = await fetch('/api/trigger-indexnow', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: idsToTrigger })
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'IndexNow submission failed.');
-
-    showToast(`IndexNow accepted ${data.processedCount} link(s) for Bing/Yahoo discovery.`, 'success');
-
-    selectedIds.clear();
-    selectAllCheckbox.checked = false;
-
-    await fetchLinks();
-  } catch (err) {
-    showToast(err.message, 'error');
-    await fetchLinks();
-  } finally {
-    btnTriggerIndexNow.disabled = false;
-    btnTriggerIndexNow.innerHTML = originalText;
   }
 }
 
@@ -644,20 +609,23 @@ async function updateGoogleIndexStatus(id, googleIndexStatus) {
   }
 }
 
-async function checkGoogleIndexStatus(id) {
+async function checkSearchIndexStatus(id) {
   try {
     setLocalGoogleIndexStatus(id, 'Checking');
 
-    const res = await fetch('/api/links/check-google-index', {
+    const res = await fetch('/api/links/check-search-indexes', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id })
     });
 
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Google index check failed.');
+    if (!res.ok && res.status !== 207) throw new Error(data.error || 'Search index check failed.');
 
-    showToast(`Google index check complete: ${data.googleIndexStatus}.`, data.googleIndexStatus === 'Found' ? 'success' : 'info');
+    const googleStatus = data.google?.status || 'Unknown';
+    const bingStatus = data.bing?.status || 'Unknown';
+    const yahooStatus = data.yahoo?.status || 'Unknown';
+    showToast(`Index check: G ${googleStatus}, B ${bingStatus}, Y ${yahooStatus}.`, data.google?.success ? 'success' : 'info');
     await fetchLinks();
   } catch (err) {
     showToast(err.message, 'error');

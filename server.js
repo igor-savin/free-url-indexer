@@ -409,6 +409,174 @@ async function submitUrlsToIndexNow(urls, req) {
   };
 }
 
+function getLinksForGoogleSubmission(ids = []) {
+  if (ids && Array.isArray(ids) && ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
+    return stmt.all(...ids);
+  }
+
+  const stmt = db.prepare(`
+    SELECT * FROM links
+    WHERE status IN (?, ?, ?, 'Pending', 'Failed')
+  `);
+  return stmt.all(STATUS.QUEUED, STATUS.SUBMISSION_FAILED, STATUS.VERIFICATION_FAILED);
+}
+
+function getLinksForIndexNowSubmission(ids = []) {
+  if (ids && Array.isArray(ids) && ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
+    return stmt.all(...ids);
+  }
+
+  const stmt = db.prepare(`
+    SELECT * FROM links
+    WHERE bing_indexnow_status IN (?, ?)
+       OR yahoo_indexnow_status IN (?, ?)
+       OR bing_indexnow_status IS NULL
+       OR yahoo_indexnow_status IS NULL
+  `);
+  return stmt.all(
+    INDEXNOW_STATUS.NOT_SUBMITTED,
+    INDEXNOW_STATUS.FAILED,
+    INDEXNOW_STATUS.NOT_SUBMITTED,
+    INDEXNOW_STATUS.FAILED
+  );
+}
+
+async function submitLinksToGoogle(linksToProcess, req) {
+  const serviceAccount = getServiceAccountKey();
+
+  if (!serviceAccount) {
+    throw new Error('Google Service Account JSON key is missing. Add GOOGLE_SERVICE_ACCOUNT_JSON in Render or upload it in settings first.');
+  }
+
+  if (linksToProcess.length === 0) {
+    return { processedCount: 0, results: [] };
+  }
+
+  const baseDomain = getBaseDomain(req);
+  let jwtClient;
+  const credentials = serviceAccount.key;
+  jwtClient = new google.auth.JWT(
+    credentials.client_email,
+    null,
+    credentials.private_key,
+    ['https://www.googleapis.com/auth/indexing'],
+    null
+  );
+  await jwtClient.authorize();
+
+  const results = [];
+  const updateStmt = db.prepare('UPDATE links SET status = ?, submitted_at = ?, last_error = ? WHERE id = ?');
+  const googleIndexing = google.indexing({ version: 'v3', auth: jwtClient });
+
+  for (const link of linksToProcess) {
+    const redirectUrl = `${baseDomain}/go/${link.id}`;
+    const now = new Date().toISOString();
+
+    try {
+      const response = await googleIndexing.urlNotifications.publish({
+        requestBody: {
+          url: redirectUrl,
+          type: 'URL_UPDATED'
+        }
+      });
+
+      if (response.status === 200) {
+        updateStmt.run(STATUS.GOOGLE_ACCEPTED, now, null, link.id);
+        results.push({ id: link.id, url: redirectUrl, success: true, status: STATUS.GOOGLE_ACCEPTED });
+      } else {
+        const errorMessage = `Google API returned status ${response.status}`;
+        updateStmt.run(STATUS.SUBMISSION_FAILED, now, errorMessage, link.id);
+        results.push({ id: link.id, url: redirectUrl, success: false, error: errorMessage, status: STATUS.SUBMISSION_FAILED });
+      }
+    } catch (error) {
+      const errMsg = error.response && error.response.data && error.response.data.error
+        ? error.response.data.error.message
+        : error.message;
+      updateStmt.run(STATUS.SUBMISSION_FAILED, now, errMsg, link.id);
+      results.push({ id: link.id, url: redirectUrl, success: false, error: errMsg, status: STATUS.SUBMISSION_FAILED });
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+
+  return { processedCount: linksToProcess.length, results };
+}
+
+async function submitLinksToIndexNow(linksToProcess, req) {
+  if (linksToProcess.length === 0) {
+    return { processedCount: 0, results: [] };
+  }
+
+  const baseDomain = getBaseDomain(req);
+  const redirectUrls = linksToProcess.map(link => `${baseDomain}/go/${link.id}`);
+  const now = new Date().toISOString();
+  const updateStmt = db.prepare(`
+    UPDATE links
+    SET bing_indexnow_status = ?,
+        yahoo_indexnow_status = ?,
+        indexnow_submitted_at = ?,
+        indexnow_error = ?
+    WHERE id = ?
+  `);
+
+  try {
+    const indexNowResult = await submitUrlsToIndexNow(redirectUrls, req);
+    const results = linksToProcess.map((link, index) => {
+      updateStmt.run(
+        INDEXNOW_STATUS.SUBMITTED,
+        INDEXNOW_STATUS.SUBMITTED,
+        now,
+        null,
+        link.id
+      );
+
+      return {
+        id: link.id,
+        url: redirectUrls[index],
+        success: true,
+        bingStatus: INDEXNOW_STATUS.SUBMITTED,
+        yahooStatus: INDEXNOW_STATUS.SUBMITTED
+      };
+    });
+
+    return {
+      processedCount: linksToProcess.length,
+      indexNowStatus: indexNowResult.status,
+      keyLocation: indexNowResult.keyLocation,
+      results
+    };
+  } catch (err) {
+    const results = linksToProcess.map((link, index) => {
+      updateStmt.run(
+        INDEXNOW_STATUS.FAILED,
+        INDEXNOW_STATUS.FAILED,
+        now,
+        err.message,
+        link.id
+      );
+
+      return {
+        id: link.id,
+        url: redirectUrls[index],
+        success: false,
+        error: err.message,
+        bingStatus: INDEXNOW_STATUS.FAILED,
+        yahooStatus: INDEXNOW_STATUS.FAILED
+      };
+    });
+
+    return {
+      processedCount: linksToProcess.length,
+      error: err.message,
+      results
+    };
+  }
+}
+
 function isLoggedIn(req) {
   return !AUTH_ENABLED || (req.isAuthenticated && req.isAuthenticated());
 }
@@ -693,193 +861,76 @@ app.delete('/api/settings/gcp-key', (req, res) => {
 // POST /api/trigger - Trigger indexing requests to Google Indexing API
 app.post('/api/trigger', async (req, res) => {
   const { ids } = req.body;
-  const serviceAccount = getServiceAccountKey();
-  
-  if (!serviceAccount) {
-    return res.status(400).json({
-      error: 'Google Service Account JSON key is missing. Add GOOGLE_SERVICE_ACCOUNT_JSON in Render or upload it in settings first.'
-    });
-  }
 
-  // Fetch URLs to index
-  let linksToProcess = [];
   try {
-    if (ids && Array.isArray(ids) && ids.length > 0) {
-      // Submit specific IDs
-      const placeholders = ids.map(() => '?').join(',');
-      const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
-      linksToProcess = stmt.all(...ids);
-    } else {
-      // Submit links that have not already been accepted by Google.
-      const stmt = db.prepare(`
-        SELECT * FROM links
-        WHERE status IN (?, ?, ?, 'Pending', 'Failed')
-      `);
-      linksToProcess = stmt.all(STATUS.QUEUED, STATUS.SUBMISSION_FAILED, STATUS.VERIFICATION_FAILED);
-    }
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to query database: ' + err.message });
-  }
-
-  if (linksToProcess.length === 0) {
-    return res.json({ success: true, message: 'No pending links to index.' });
-  }
-
-  let baseDomain = getBaseDomain(req);
-  
-  // Set up Google JWT auth client
-  let jwtClient;
-  try {
-    const credentials = serviceAccount.key;
-    jwtClient = new google.auth.JWT(
-      credentials.client_email,
-      null,
-      credentials.private_key,
-      ['https://www.googleapis.com/auth/indexing'],
-      null
-    );
-    await jwtClient.authorize();
-  } catch (err) {
-    return res.status(500).json({ error: 'Google authentication failed: ' + err.message });
-  }
-
-  const results = [];
-  const updateStmt = db.prepare('UPDATE links SET status = ?, submitted_at = ?, last_error = ? WHERE id = ?');
-  const googleIndexing = google.indexing({ version: 'v3', auth: jwtClient });
-
-  for (const link of linksToProcess) {
-    const redirectUrl = `${baseDomain}/go/${link.id}`;
-    const now = new Date().toISOString();
-
-    try {
-      const response = await googleIndexing.urlNotifications.publish({
-        requestBody: {
-          url: redirectUrl,
-          type: 'URL_UPDATED'
-        }
-      });
-      
-      if (response.status === 200) {
-        updateStmt.run(STATUS.GOOGLE_ACCEPTED, now, null, link.id);
-        results.push({ id: link.id, url: redirectUrl, success: true, status: STATUS.GOOGLE_ACCEPTED });
-      } else {
-        const errorMessage = `Google API returned status ${response.status}`;
-        updateStmt.run(STATUS.SUBMISSION_FAILED, now, errorMessage, link.id);
-        results.push({ id: link.id, url: redirectUrl, success: false, error: errorMessage, status: STATUS.SUBMISSION_FAILED });
-      }
-    } catch (error) {
-      const errMsg = error.response && error.response.data && error.response.data.error
-        ? error.response.data.error.message
-        : error.message;
-      updateStmt.run(STATUS.SUBMISSION_FAILED, now, errMsg, link.id);
-      results.push({ id: link.id, url: redirectUrl, success: false, error: errMsg, status: STATUS.SUBMISSION_FAILED });
+    const linksToProcess = getLinksForGoogleSubmission(ids);
+    if (linksToProcess.length === 0) {
+      return res.json({ success: true, message: 'No pending links to index.', processedCount: 0, results: [] });
     }
 
-    // Short sleep to respect rate limits
-    await new Promise(resolve => setTimeout(resolve, 300));
+    const result = await submitLinksToGoogle(linksToProcess, req);
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
-
-  res.json({ success: true, processedCount: linksToProcess.length, results });
 });
 
 // POST /api/trigger-indexnow - Submit redirect URLs to IndexNow for Bing/Yahoo discovery.
 app.post('/api/trigger-indexnow', async (req, res) => {
   const { ids } = req.body;
-  let linksToProcess = [];
 
   try {
-    if (ids && Array.isArray(ids) && ids.length > 0) {
-      const placeholders = ids.map(() => '?').join(',');
-      const stmt = db.prepare(`SELECT * FROM links WHERE id IN (${placeholders})`);
-      linksToProcess = stmt.all(...ids);
-    } else {
-      const stmt = db.prepare(`
-        SELECT * FROM links
-        WHERE bing_indexnow_status IN (?, ?)
-           OR yahoo_indexnow_status IN (?, ?)
-           OR bing_indexnow_status IS NULL
-           OR yahoo_indexnow_status IS NULL
-      `);
-      linksToProcess = stmt.all(
-        INDEXNOW_STATUS.NOT_SUBMITTED,
-        INDEXNOW_STATUS.FAILED,
-        INDEXNOW_STATUS.NOT_SUBMITTED,
-        INDEXNOW_STATUS.FAILED
-      );
+    const linksToProcess = getLinksForIndexNowSubmission(ids);
+    if (linksToProcess.length === 0) {
+      return res.json({ success: true, message: 'No links need IndexNow submission.', processedCount: 0, results: [] });
+    }
+
+    const result = await submitLinksToIndexNow(linksToProcess, req);
+    const failed = result.results.some(item => !item.success);
+    return res.status(failed ? 502 : 200).json({ success: !failed, ...result });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/trigger-all - Submit selected URLs to Google and IndexNow together.
+app.post('/api/trigger-all', async (req, res) => {
+  const { ids } = req.body;
+
+  const result = {
+    success: true,
+    google: { processedCount: 0, results: [] },
+    indexNow: { processedCount: 0, results: [] }
+  };
+
+  try {
+    const googleLinks = getLinksForGoogleSubmission(ids);
+    result.google = await submitLinksToGoogle(googleLinks, req);
+  } catch (err) {
+    result.success = false;
+    result.google = {
+      processedCount: 0,
+      error: err.message,
+      results: []
+    };
+  }
+
+  try {
+    const indexNowLinks = getLinksForIndexNowSubmission(ids);
+    result.indexNow = await submitLinksToIndexNow(indexNowLinks, req);
+    if (result.indexNow.results.some(item => !item.success)) {
+      result.success = false;
     }
   } catch (err) {
-    return res.status(500).json({ error: 'Failed to query database: ' + err.message });
-  }
-
-  if (linksToProcess.length === 0) {
-    return res.json({ success: true, message: 'No links need IndexNow submission.' });
-  }
-
-  const baseDomain = getBaseDomain(req);
-  const redirectUrls = linksToProcess.map(link => `${baseDomain}/go/${link.id}`);
-  const now = new Date().toISOString();
-  const updateStmt = db.prepare(`
-    UPDATE links
-    SET bing_indexnow_status = ?,
-        yahoo_indexnow_status = ?,
-        indexnow_submitted_at = ?,
-        indexnow_error = ?
-    WHERE id = ?
-  `);
-
-  try {
-    const indexNowResult = await submitUrlsToIndexNow(redirectUrls, req);
-    const results = linksToProcess.map((link, index) => {
-      updateStmt.run(
-        INDEXNOW_STATUS.SUBMITTED,
-        INDEXNOW_STATUS.SUBMITTED,
-        now,
-        null,
-        link.id
-      );
-
-      return {
-        id: link.id,
-        url: redirectUrls[index],
-        success: true,
-        bingStatus: INDEXNOW_STATUS.SUBMITTED,
-        yahooStatus: INDEXNOW_STATUS.SUBMITTED
-      };
-    });
-
-    res.json({
-      success: true,
-      processedCount: linksToProcess.length,
-      indexNowStatus: indexNowResult.status,
-      keyLocation: indexNowResult.keyLocation,
-      results
-    });
-  } catch (err) {
-    const results = linksToProcess.map((link, index) => {
-      updateStmt.run(
-        INDEXNOW_STATUS.FAILED,
-        INDEXNOW_STATUS.FAILED,
-        now,
-        err.message,
-        link.id
-      );
-
-      return {
-        id: link.id,
-        url: redirectUrls[index],
-        success: false,
-        error: err.message,
-        bingStatus: INDEXNOW_STATUS.FAILED,
-        yahooStatus: INDEXNOW_STATUS.FAILED
-      };
-    });
-
-    res.status(502).json({
+    result.success = false;
+    result.indexNow = {
+      processedCount: 0,
       error: err.message,
-      processedCount: linksToProcess.length,
-      results
-    });
+      results: []
+    };
   }
+
+  res.status(result.success ? 200 : 207).json(result);
 });
 
 // POST /api/check-status - Verify redirect and target reachability.
@@ -1044,6 +1095,80 @@ app.post('/api/links/check-google-index', async (req, res) => {
       googleIndexStatus: GOOGLE_INDEX_STATUS.CHECK_FAILED,
       googleIndexCheckedAt: checkedAt
     });
+  }
+});
+
+// POST /api/links/check-search-indexes - Check available search index outcomes together.
+app.post('/api/links/check-search-indexes', async (req, res) => {
+  const { id } = req.body;
+
+  if (!id) {
+    return res.status(400).json({ error: 'A valid id is required.' });
+  }
+
+  try {
+    const selectStmt = db.prepare('SELECT * FROM links WHERE id = ?');
+    const link = selectStmt.get(id);
+
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found.' });
+    }
+
+    let googleResult;
+    try {
+      const result = await checkGoogleIndexForUrl(link.original_url);
+      const googleIndexStatus = result.found
+        ? GOOGLE_INDEX_STATUS.FOUND
+        : GOOGLE_INDEX_STATUS.NOT_FOUND;
+      const checkedAt = new Date().toISOString();
+      const updateStmt = db.prepare(`
+        UPDATE links
+        SET google_index_status = ?, google_index_checked_at = ?
+        WHERE id = ?
+      `);
+      updateStmt.run(googleIndexStatus, checkedAt, id);
+      googleResult = {
+        success: true,
+        status: googleIndexStatus,
+        checkedAt,
+        query: result.query,
+        searchUrl: result.searchUrl,
+        signal: result.signal
+      };
+    } catch (err) {
+      const checkedAt = new Date().toISOString();
+      const updateStmt = db.prepare(`
+        UPDATE links
+        SET google_index_status = ?, google_index_checked_at = ?
+        WHERE id = ?
+      `);
+      updateStmt.run(GOOGLE_INDEX_STATUS.CHECK_FAILED, checkedAt, id);
+      googleResult = {
+        success: false,
+        status: GOOGLE_INDEX_STATUS.CHECK_FAILED,
+        checkedAt,
+        error: err.message
+      };
+    }
+
+    const refreshedLink = selectStmt.get(id);
+    res.json({
+      success: googleResult.success,
+      id,
+      google: googleResult,
+      bing: {
+        status: refreshedLink.bing_indexnow_status || INDEXNOW_STATUS.NOT_SUBMITTED,
+        submittedAt: refreshedLink.indexnow_submitted_at || null,
+        note: 'Bing exact index checks are not available through a free official API.'
+      },
+      yahoo: {
+        status: refreshedLink.yahoo_indexnow_status || INDEXNOW_STATUS.NOT_SUBMITTED,
+        submittedAt: refreshedLink.indexnow_submitted_at || null,
+        note: 'Yahoo is tracked through IndexNow sharing; exact index checks are not available through a free official API.'
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check search indexes: ' + err.message });
   }
 });
 
