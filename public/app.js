@@ -285,6 +285,7 @@ function renderLinksTable() {
       ? new Date(link.seo_checked_at).toLocaleString()
       : '';
     const seoTitle = buildSeoTitle(seoReport, seoCheckedAt);
+    const seoExplanation = getSeoExplanation(seoReport);
 
     return `
       <tr data-id="${link.id}">
@@ -305,7 +306,7 @@ function renderLinksTable() {
             <div class="engine-line">
               <span class="engine-badge ${seoMeta.className}" title="${seoTitle}">${seoMeta.label}</span>
             </div>
-            ${seoReport?.issues?.length ? `<div class="status-error" title="${escapeAttribute(seoReport.issues.join(' | '))}">${escapeHtml(seoReport.issues[0])}</div>` : ''}
+            ${seoExplanation ? `<div class="status-note ${seoStatus === 'Blocked' || seoStatus === 'Error' ? 'status-note-danger' : 'status-note-warning'}" title="${escapeAttribute(seoReport.issues.join(' | '))}">${escapeHtml(seoExplanation)}</div>` : ''}
             <div class="index-actions">
               <button class="index-action-btn" onclick="checkSearchIndexStatus('${link.id}')" title="Check available Google, Bing, and Yahoo index signals">Check</button>
               <button class="index-action-btn" onclick="checkTargetSeo('${link.id}')" title="Check whether the target page looks crawlable">SEO</button>
@@ -722,6 +723,50 @@ function buildSeoTitle(report, checkedAt) {
   if (report?.canonical) parts.push(`Canonical: ${report.canonical}`);
   if (report?.issues?.length) parts.push(`Issues: ${report.issues.join(' | ')}`);
   return parts.join(' · ');
+}
+
+function getSeoExplanation(report) {
+  if (!report?.issues?.length) return '';
+  const issue = report.issues[0];
+  const allIssues = report.issues.join(' | ');
+
+  if (/HTTP 403/i.test(allIssues)) {
+    return 'Blocked by the target site. It returned 403, so our checker could not read the page.';
+  }
+
+  if (/HTTP 404/i.test(allIssues)) {
+    return 'Page not found. The target URL returned 404.';
+  }
+
+  if (/HTTP 5/i.test(allIssues)) {
+    return 'Target site server error. Try again later.';
+  }
+
+  if (/noindex/i.test(allIssues)) {
+    return 'The target page tells search engines not to index it.';
+  }
+
+  if (/robots none/i.test(allIssues)) {
+    return 'The target page blocks indexing and link following.';
+  }
+
+  if (/canonical points elsewhere/i.test(allIssues)) {
+    return 'The target page points Google to a different canonical URL.';
+  }
+
+  if (/Non-HTML content type/i.test(allIssues)) {
+    return 'The target did not return a normal web page.';
+  }
+
+  if (/very thin HTML response/i.test(allIssues)) {
+    return 'The page loaded, but there may not be much content for search engines to read.';
+  }
+
+  if (/missing title/i.test(allIssues)) {
+    return 'The page is missing a title tag.';
+  }
+
+  return issue;
 }
 
 function escapeAttribute(value) {
