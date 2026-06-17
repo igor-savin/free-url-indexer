@@ -244,7 +244,8 @@ function renderLinksTable() {
           <input type="checkbox" class="link-select-checkbox" data-id="${link.id}" ${isChecked ? 'checked' : ''}>
         </td>
         <td>
-          <span class="badge ${badgeClass}">${link.status}</span>
+            <span class="badge ${badgeClass}" title="${link.last_error || ''}">${link.status}</span>
+            ${link.last_error ? `<div class="status-error" title="${link.last_error}">${link.last_error}</div>` : ''}
         </td>
         <td>
           <div class="link-display">
@@ -341,7 +342,12 @@ async function handleTriggerIndexing() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Trigger failed.');
 
-    showToast(`Submissions complete. Google APIs returned code 200 for ${data.processedCount} link(s).`, 'success');
+    const failedResults = (data.results || []).filter(result => !result.success);
+    if (failedResults.length > 0) {
+      showToast(`${failedResults.length} submission(s) failed. Open the row status for details.`, 'error');
+    } else {
+      showToast(`Submissions complete. Google APIs returned code 200 for ${data.processedCount} link(s).`, 'success');
+    }
     
     // Clear selection
     selectedIds.clear();

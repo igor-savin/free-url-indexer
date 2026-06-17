@@ -78,9 +78,18 @@ try {
       status TEXT DEFAULT 'Pending',
       created_at TEXT,
       submitted_at TEXT,
-      indexed_at TEXT
+      indexed_at TEXT,
+      last_error TEXT
     )
   `);
+
+  try {
+    db.exec('ALTER TABLE links ADD COLUMN last_error TEXT');
+  } catch (err) {
+    if (!String(err.message).includes('duplicate column name')) {
+      throw err;
+    }
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
@@ -105,6 +114,43 @@ function getSetting(key) {
 function setSetting(key, value) {
   const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
   stmt.run(key, value);
+}
+
+function cleanBaseDomain(baseDomain) {
+  return baseDomain && baseDomain.endsWith('/') ? baseDomain.slice(0, -1) : baseDomain;
+}
+
+function isLocalBaseDomain(baseDomain) {
+  try {
+    const hostname = new URL(baseDomain).hostname;
+    return hostname === 'localhost' || hostname === '127.0.0.1';
+  } catch (err) {
+    return false;
+  }
+}
+
+function getRequestBaseDomain(req) {
+  if (!req || !req.get('host')) return null;
+
+  const protocol = req.get('x-forwarded-proto') || req.protocol || 'https';
+  return cleanBaseDomain(`${protocol}://${req.get('host')}`);
+}
+
+function getBaseDomain(req) {
+  const envBaseDomain = cleanBaseDomain(process.env.BASE_DOMAIN);
+  if (envBaseDomain) return envBaseDomain;
+
+  const savedBaseDomain = getSetting('base_domain');
+  if (savedBaseDomain && !isLocalBaseDomain(savedBaseDomain)) {
+    return savedBaseDomain;
+  }
+
+  const requestBaseDomain = getRequestBaseDomain(req);
+  if (requestBaseDomain && !isLocalBaseDomain(requestBaseDomain)) {
+    return requestBaseDomain;
+  }
+
+  return savedBaseDomain || `http://localhost:${PORT}`;
 }
 
 // ----------------------------------------------------
@@ -175,7 +221,7 @@ app.post('/api/submit', (req, res) => {
 
   const selectStmt = db.prepare('SELECT id, original_url, status, created_at FROM links WHERE original_url = ?');
 
-  let baseDomain = getSetting('base_domain') || `http://localhost:${PORT}`;
+  let baseDomain = getBaseDomain(req);
 
   for (let url of urls) {
     url = url.trim();
@@ -228,7 +274,7 @@ app.post('/api/submit', (req, res) => {
 
 // GET /api/settings - Retrieve app configurations
 app.get('/api/settings', (req, res) => {
-  const baseDomain = getSetting('base_domain') || `http://localhost:${PORT}`;
+  const baseDomain = getBaseDomain(req);
   const serviceAccount = getServiceAccountKey();
   const hasGcpKey = Boolean(serviceAccount);
   let gcpEmail = null;
@@ -254,8 +300,7 @@ app.post('/api/settings', (req, res) => {
   try {
     if (baseDomain) {
       // Clean trailing slash
-      const cleanDomain = baseDomain.endsWith('/') ? baseDomain.slice(0, -1) : baseDomain;
-      setSetting('base_domain', cleanDomain);
+      setSetting('base_domain', cleanBaseDomain(baseDomain));
     }
 
     if (gcpKeyJson) {
@@ -314,7 +359,7 @@ app.post('/api/trigger', async (req, res) => {
     return res.json({ success: true, message: 'No pending links to index.' });
   }
 
-  let baseDomain = getSetting('base_domain') || `http://localhost:${PORT}`;
+  let baseDomain = getBaseDomain(req);
   
   // Set up Google JWT auth client
   let jwtClient;
@@ -333,7 +378,7 @@ app.post('/api/trigger', async (req, res) => {
   }
 
   const results = [];
-  const updateStmt = db.prepare('UPDATE links SET status = ?, submitted_at = ? WHERE id = ?');
+  const updateStmt = db.prepare('UPDATE links SET status = ?, submitted_at = ?, last_error = ? WHERE id = ?');
   const googleIndexing = google.indexing({ version: 'v3', auth: jwtClient });
 
   for (const link of linksToProcess) {
@@ -349,17 +394,18 @@ app.post('/api/trigger', async (req, res) => {
       });
       
       if (response.status === 200) {
-        updateStmt.run('Submitted', now, link.id);
+        updateStmt.run('Submitted', now, null, link.id);
         results.push({ id: link.id, url: redirectUrl, success: true, status: 'Submitted' });
       } else {
-        updateStmt.run('Failed', now, link.id);
+        const errorMessage = `Google API returned status ${response.status}`;
+        updateStmt.run('Failed', now, errorMessage, link.id);
         results.push({ id: link.id, url: redirectUrl, success: false, error: `Google API returned status ${response.status}`, status: 'Failed' });
       }
     } catch (error) {
       const errMsg = error.response && error.response.data && error.response.data.error
         ? error.response.data.error.message
         : error.message;
-      updateStmt.run('Failed', now, link.id);
+      updateStmt.run('Failed', now, errMsg, link.id);
       results.push({ id: link.id, url: redirectUrl, success: false, error: errMsg, status: 'Failed' });
     }
 

@@ -505,6 +505,16 @@ tr:hover td {
 }
 .badge-failed::before { background: #f87171; }
 
+.status-error {
+  color: #fca5a5;
+  font-size: 0.72rem;
+  line-height: 1.25;
+  margin-top: 6px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* URL links styling */
 .link-display {
   display: flex;
